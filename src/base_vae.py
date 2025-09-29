@@ -90,7 +90,7 @@ class BaseVAE(nn.Module, ABC):
         Forward pass through the VAE.
         """
         # 1. Get library size factor for NB loss
-        library = torch.sum(x, dim=1, keepdim=True)
+        library = torch.sum(x, dim=1, keepdim=True).clamp_min(1e-8)
         
         # 2. Encode and get latent parameters
         latent_params = self._get_latent_params(x)
@@ -106,7 +106,10 @@ class BaseVAE(nn.Module, ABC):
         px_scale = self.px_scale_decoder(hidden_decoder)
         px_rate = library * px_scale
         # Inverse dispersion of the NB distribution
-        px_r = torch.exp(self.px_r_decoder(hidden_decoder))
+        #px_r = torch.exp(self.px_r_decoder(hidden_decoder))
+        px_r = torch.nn.functional.softplus(self.px_r_decoder(hidden_decoder)) + 1e-6
+        px_r = px_r.clamp(min=1e-6, max=1e6)  
+        px_rate = px_rate.clamp(min=1e-8, max=1e12)
 
         return {
             "z": z,
