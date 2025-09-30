@@ -17,10 +17,15 @@ class BaseVAE(nn.Module, ABC):
         n_latent: int,
         n_hidden: int = 64,
         n_layers: int = 2,
+        likelihood: str = "nb", # "nb" or "gaussian"
+        gaussian_homoscedastic: bool = False,  # if True, fixed sigma^2=1
     ):
         super().__init__()
+        assert likelihood in ["nb", "gaussian"], "likelihood must be 'nb' or 'gaussian'"
         self.n_input = n_input
         self.n_latent = n_latent
+        self.likelihood = likelihood
+        self.gaussian_homoscedastic = gaussian_homoscedastic
 
         # Encoder and Decoder networks
         self.encoder = self._build_network(
@@ -38,12 +43,17 @@ class BaseVAE(nn.Module, ABC):
             n_layers=n_layers,
             activation=nn.ReLU()
         )
-        
-        # Output layers for Negative Binomial distribution
-        # Mean parameter
-        self.px_scale_decoder = nn.Sequential(nn.Linear(n_hidden, n_input), nn.Softmax(dim=-1))
-        # Inverse dispersion parameter
-        self.px_r_decoder = nn.Linear(n_hidden, n_input)
+
+        if self.likelihood == "nb":
+            # Output layers for Negative Binomial distribution
+            # Mean parameter
+            self.px_scale_decoder = nn.Sequential(nn.Linear(n_hidden, n_input), nn.Softmax(dim=-1))
+            # Inverse dispersion parameter
+            self.px_r_decoder = nn.Linear(n_hidden, n_input)
+        else:
+            self.px_mu_decoder = nn.Linear(n_hidden, n_input)
+            if not self.gaussian_homoscedastic:
+                self.px_logvar_decoder = nn.Linear(n_hidden, n_input)
 
 
     def _build_network(
@@ -90,7 +100,9 @@ class BaseVAE(nn.Module, ABC):
         Forward pass through the VAE.
         """
         # 1. Get library size factor for NB loss
-        library = torch.sum(x, dim=1, keepdim=True).clamp_min(1e-8)
+        library = None
+        if self.likelihood == "nb":
+            library = torch.sum(x, dim=1, keepdim=True).clamp_min(1e-8)
         
         # 2. Encode and get latent parameters
         latent_params = self._get_latent_params(x)
@@ -100,52 +112,71 @@ class BaseVAE(nn.Module, ABC):
         
         # 4. Decode
         hidden_decoder = self.decoder(z)
+
+        out = {"z": z, "latent_params": latent_params}
         
         # 5. Get reconstruction distribution parameters
-        # Mean of the NB distribution
-        px_scale = self.px_scale_decoder(hidden_decoder)
-        px_rate = library * px_scale
-        # Inverse dispersion of the NB distribution
-        #px_r = torch.exp(self.px_r_decoder(hidden_decoder))
-        px_r = torch.nn.functional.softplus(self.px_r_decoder(hidden_decoder)) + 1e-6
-        px_r = px_r.clamp(min=1e-6, max=1e6)  
-        px_rate = px_rate.clamp(min=1e-8, max=1e12)
-
-        return {
-            "z": z,
-            "latent_params": latent_params,
-            "px_rate": px_rate,
-            "px_r": px_r,
-        }
+        if self.likelihood == "nb":
+            # Mean of the NB distribution
+            px_scale = self.px_scale_decoder(hidden_decoder)
+            px_rate = library * px_scale
+            # Inverse dispersion of the NB distribution
+            #px_r = torch.exp(self.px_r_decoder(hidden_decoder))
+            px_r = torch.nn.functional.softplus(self.px_r_decoder(hidden_decoder)) + 1e-6
+            px_r = px_r.clamp(min=1e-6, max=1e6)  
+            px_rate = px_rate.clamp(min=1e-8, max=1e12)
+            out.update({"px_rate": px_rate, "px_r": px_r})
+        else:
+            px_mu = self.px_mu_decoder(hidden_decoder)
+            if self.gaussian_homoscedastic:
+                out.update({"px_mu": px_mu, "px_logvar": None})
+            else:
+                px_logvar = self.px_logvar_decoder(hidden_decoder)
+                px_logvar = torch.clamp(px_logvar, min=-10.0, max=10.0) 
+                out.update({"px_mu": px_mu, "px_logvar": px_logvar})
+        
+        return out
 
     def loss(self, x: torch.Tensor, forward_output: dict, kl_weight: float = 1.0) -> dict:
         """
         Calculates the evidence lower bound (ELBO) loss.
         """
         # --- CORRECTED PART ---
-
-        px_rate = forward_output["px_rate"]
-        px_r = forward_output["px_r"]
-        
-        # Add a small constant for numerical stability to prevent log(0)
         eps = 1e-8
-        
-        logits = torch.log(px_r + eps) - torch.log(px_rate + eps)
 
-        # --- DIAGNOSTIC PRINTS to add ---
-        if torch.isnan(px_rate).any() or torch.isinf(px_rate).any():
-            print(f"!!! px_rate contains nan or inf. Max value: {px_rate.max()}")
-        if torch.isnan(px_r).any() or torch.isinf(px_r).any():
-            print(f"!!! px_r contains nan or inf. Max value: {px_r.max()}")
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print(f"!!! logits contains nan or inf. Max value: {logits.max()}")
-        # --- END DIAGNOSTICS ---
-        
-        # Reconstruction Loss (Negative Log-Likelihood of NB)
-        recon_loss = -NegativeBinomial(
-            total_count=px_r, 
-            logits=logits
-        ).log_prob(x).sum(dim=-1)
+        if self.likelihood == "nb":
+            px_rate = forward_output["px_rate"]
+            px_r = forward_output["px_r"]
+            
+            # Add a small constant for numerical stability to prevent log(0)
+            #eps = 1e-8
+            
+            logits = torch.log(px_r + eps) - torch.log(px_rate + eps)
+
+            # --- DIAGNOSTIC PRINTS to add ---
+            if torch.isnan(px_rate).any() or torch.isinf(px_rate).any():
+                print(f"!!! px_rate contains nan or inf. Max value: {px_rate.max()}")
+            if torch.isnan(px_r).any() or torch.isinf(px_r).any():
+                print(f"!!! px_r contains nan or inf. Max value: {px_r.max()}")
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"!!! logits contains nan or inf. Max value: {logits.max()}")
+            # --- END DIAGNOSTICS ---
+            
+            # Reconstruction Loss (Negative Log-Likelihood of NB)
+            recon_loss = -NegativeBinomial(
+                total_count=px_r, 
+                logits=logits
+            ).log_prob(x).sum(dim=-1)
+        else:
+            mu = forward_output["px_mu"]
+            if self.gaussian_homoscedastic or (forward_output.get("px_logvar", None) is None):
+                recon_loss = ((x - mu) ** 2).sum(dim=-1) * 0.5
+            else:
+                logvar = forward_output["px_logvar"]
+                var = torch.exp(logvar).clamp_min(1e-10)
+                #recon_loss = 0.5 * (logvar + (x - mu) ** 2 / var + torch.log(torch.tensor(2 * 3.141592653589793, device=x.device)))
+                recon_loss = 0.5 * (logvar + (x - mu) ** 2 / var).sum(dim=-1)
+
 
         # --- END OF CORRECTION ---
 
