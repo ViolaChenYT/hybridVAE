@@ -20,18 +20,37 @@ class VAE(BaseVAE):
         n_hidden: int = 128,
         n_layers: int = 2,
         clamp_logvar: tuple[float, float] = (-10.0, 10.0),
+        likelihood: str = "nb",  # "nb" or "gaussian"
+        gaussian_homoscedastic: bool = False,  # if True, fixed sigma^2=1
     ):
-        super().__init__(n_input, n_latent, n_hidden=n_hidden, n_layers=n_layers)
+        super().__init__(n_input, n_latent, n_hidden=n_hidden, n_layers=n_layers, likelihood=likelihood, gaussian_homoscedastic=gaussian_homoscedastic)
+        
+        self._clamp_lv = clamp_logvar
+        
         # Heads from the encoder's final hidden to μ and logσ²
         self.z_mean = nn.Linear(n_hidden, n_latent)
         self.z_logvar = nn.Linear(n_hidden, n_latent)
-        self._clamp_lv = clamp_logvar
+        
 
         # Optional: small weight init for stability
-        for m in [self.z_mean, self.z_logvar, self.px_r_decoder]:
+        #, self.px_r_decoder, self.px_scale_decoder
+        for m in [self.z_mean, self.z_logvar]:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
+        
+        if self.likelihood == "nb":
+            if isinstance(self.px_scale_decoder[0], nn.Linear):
+                nn.init.xavier_uniform_(self.px_scale_decoder[0].weight)
+                nn.init.zeros_(self.px_scale_decoder[0].bias)
+            nn.init.xavier_uniform_(self.px_r_decoder.weight)
+            nn.init.zeros_(self.px_r_decoder.bias)
+        else:
+            nn.init.xavier_uniform_(self.px_mu_decoder.weight)
+            nn.init.zeros_(self.px_mu_decoder.bias)
+            if not self.gaussian_homoscedastic:
+                nn.init.xavier_uniform_(self.px_logvar_decoder.weight)
+                nn.init.zeros_(self.px_logvar_decoder.bias)
 
     # ---- required by BaseVAE ----
     def _get_latent_params(self, x: torch.Tensor):
@@ -56,9 +75,15 @@ class VAE(BaseVAE):
     # (Optional) guardrails for decoder extremes
     def forward(self, x: torch.Tensor) -> dict:
         out = super().forward(x)
-        # Cap to avoid pathological values in early training
-        out["px_rate"] = torch.clamp(out["px_rate"], min=1e-8, max=1e8)
-        out["px_r"]    = torch.clamp(out["px_r"],    min=1e-6, max=1e8)
+
+        if self.likelihood == "nb":
+            # Cap to avoid pathological values in early training
+            out["px_rate"] = torch.clamp(out["px_rate"], min=1e-8, max=1e8)
+            out["px_r"]    = torch.clamp(out["px_r"],    min=1e-6, max=1e8)
+        else:
+            if out.get("px_logvar", None) is not None:
+                out["px_logvar"] = torch.clamp(out["px_logvar"], min=-10.0, max=10.0)
+        
         return out
 
 
