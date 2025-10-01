@@ -24,15 +24,16 @@ class GMVAE(BaseVAE):
         n_input: int,
         n_latent: int,
         fixed_means: torch.Tensor, # Shape: (n_components, n_latent)
-        prior_sigma: float = 0.5, # shared across all clusters
+        prior_sigma: float = 0.2, # shared across all clusters
         n_batches: int = 0,
         batch_emb_dim: int = 8,
         batch_index: torch.Tensor | None = None,
+        likelihood: str = "nb",
         n_hidden: int = 128,
         n_layers: int = 2,
         prior_logits: torch.Tensor | None = None,  # optional non-uniform p(c)
     ):
-        super().__init__(n_input, n_latent, n_hidden, n_layers, n_batches, batch_emb_dim)
+        super().__init__(n_input, n_latent, n_hidden, n_layers, likelihood, n_batches=n_batches, batch_emb_dim=batch_emb_dim)
 
         n_components, d = fixed_means.shape
         assert d == n_latent, "fixed_means dim must equal n_latent"
@@ -54,11 +55,15 @@ class GMVAE(BaseVAE):
         self.qz_act = nn.Identity()  # placeholder for extra nonlinearity???
 
 
-    def _get_latent_params_from_h(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  
+    def _get_latent_params_from_h(self, h: torch.Tensor, residual_mean_pen = False, hard_fix = False) -> Tuple[torch.Tensor, torch.Tensor]:  
         logits_c = self.enc_c(h)  # (B, K)
         raw = self.enc_z(h).view(h.size(0), self.n_components, 2 * self.n_latent)
         mu_q, logvar_q = torch.chunk(raw, 2, dim=-1)
         logvar_q = logvar_q.clamp(-10.0, 10.0)
+        if hard_fix:
+            mu_q = self.mu_prior.unsqueeze(0).expand(h.size(0), self.n_components, self.n_latent)  # fixed mean
+        elif residual_mean_pen:
+            mu_q = mu_q + self.mu_prior.unsqueeze(0)
         return logits_c, mu_q, logvar_q
 
     def _get_latent_params(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -123,3 +128,21 @@ class GMVAE(BaseVAE):
         kl_z = (probs_c * kl_z_given_c).sum(dim=1)                             # (B,)
 
         return kl_c + kl_z
+
+    def loss(self, x, forward_output, aggregate_alignment_pen=False, residual_mean_pen=False, kl_weight=1.0, align_weight=5e-2,anchor_weight=1e-2):
+        base = super().loss(x, forward_output, kl_weight)
+        logits_c, mu_q, _ = forward_output["latent_params"]           # (B,K,d) 
+        if residual_mean_pen:
+            resid = mu_q - self.mu_prior.unsqueeze(0)
+            anchor = (resid ** 2).mean()
+            base["loss"] = base["loss"] + anchor_weight * anchor
+            base["anchor"] = anchor.detach()
+        if aggregate_alignment_pen:
+            probs = torch.distributions.Categorical(logits=logits_c).probs  # (B,K)
+            denom = probs.sum(dim=0, keepdim=True).clamp_min(1e-8)        # (1,K)
+            w = (probs / denom).unsqueeze(-1)                              # (B,K,1)
+            mu_bar = (w * mu_q).sum(dim=0)                                 # (K,d)
+            align = ((mu_bar - self.mu_prior) ** 2).sum(dim=-1).mean()
+            base["loss"] = base["loss"] + align_weight * align
+            base["align"] = align.detach()
+        return base

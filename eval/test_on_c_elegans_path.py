@@ -1,7 +1,8 @@
+from re import S
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import os
+import os, random
 import sys
 module_path = os.path.abspath(os.path.join('.', 'src'))
 if module_path not in sys.path:
@@ -23,6 +24,21 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import argparse
 import seaborn as sns
+
+def set_seed(seed: int = 42):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # cuDNN / backends
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    # Strong determinism (may error if an op has no deterministic impl)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+set_seed()
 
 def load_h5ad_data(file_path, label_key):
     """
@@ -149,7 +165,7 @@ def batch_iter(X, batch_index, batch_size: int, shuffle: bool = True):
         else:
             yield xb, batch_index[idx]
 
-def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None):
+def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None, early_stopping=True):
     """
     Train GMVAE model.
     
@@ -191,7 +207,7 @@ def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None):
     kl_weight_history = []
     
     print(f"Starting training for {n_epochs} epochs...")
-    
+    best = float("inf");bad=0;patience = 80
     for epoch in range(n_epochs):
         model.train()
 
@@ -209,6 +225,12 @@ def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if loss < best - 1e-4:
+            best = loss; bad = 0; torch.save(model.state_dict(), "best.pt)")
+        else: bad += 1
+        if early_stopping and bad > patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
         
         if (epoch + 1) % args.print_every == 0:
             print(
@@ -346,13 +368,13 @@ if __name__ == "__main__":
                        help="Number of hidden layers")
     
     # Training arguments
-    parser.add_argument("--n_epochs", '-e', type=int, default=600,
+    parser.add_argument("--n_epochs", '-e', type=int, default=800,
                        help="Number of training epochs")
-    parser.add_argument("--n_warmup_epochs", '-w', type=int, default=50,
+    parser.add_argument("--n_warmup_epochs", '-w', type=int, default=100,
                        help="Number of warmup epochs for KL annealing")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
+    parser.add_argument("--learning_rate", type=float, default=5e-4,
                        help="Learning rate")
-    parser.add_argument("--prior_weight", type=float, default=10.0,
+    parser.add_argument("--prior_weight", type=float, default=5.0,
                        help="Weight for prior loss")
     parser.add_argument("--print_every", type=int, default=20,
                        help="Print training progress every N epochs")
@@ -362,7 +384,7 @@ if __name__ == "__main__":
                        help="Comma-separated list of prior values (e.g., '-2,-1,0,1')", nargs="+")
     parser.add_argument("--n_components", '-K', type=int, default=None,
                        help="Number of components (if not specified, inferred from prior_values)")
-    parser.add_argument("--prior_sigma", type=float, default=0.5,
+    parser.add_argument("--prior_sigma", type=float, default=0.05,
                        help="Prior sigma (not used in current implementation)")
     
     args = parser.parse_args()
