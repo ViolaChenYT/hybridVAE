@@ -25,11 +25,14 @@ class GMVAE(BaseVAE):
         n_latent: int,
         fixed_means: torch.Tensor, # Shape: (n_components, n_latent)
         prior_sigma: float = 0.5, # shared across all clusters
+        n_batches: int = 0,
+        batch_emb_dim: int = 8,
+        batch_index: torch.Tensor | None = None,
         n_hidden: int = 128,
         n_layers: int = 2,
         prior_logits: torch.Tensor | None = None,  # optional non-uniform p(c)
     ):
-        super().__init__(n_input, n_latent, n_hidden, n_layers)
+        super().__init__(n_input, n_latent, n_hidden, n_layers, n_batches, batch_emb_dim)
 
         n_components, d = fixed_means.shape
         assert d == n_latent, "fixed_means dim must equal n_latent"
@@ -50,15 +53,17 @@ class GMVAE(BaseVAE):
         # placeholder for extra nonlinearity???
         self.qz_act = nn.Identity()  # placeholder for extra nonlinearity???
 
-    def _get_latent_params(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.encoder(x)
-        logits_c = self.enc_c(hidden)
-        raw = self.enc_z(hidden)
-        batch_size = raw.shape[0] # batch size
-        raw = raw.view(batch_size, self.n_components,2 * self.n_latent)
+
+    def _get_latent_params_from_h(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  
+        logits_c = self.enc_c(h)  # (B, K)
+        raw = self.enc_z(h).view(h.size(0), self.n_components, 2 * self.n_latent)
         mu_q, logvar_q = torch.chunk(raw, 2, dim=-1)
         logvar_q = logvar_q.clamp(-10.0, 10.0)
         return logits_c, mu_q, logvar_q
+
+    def _get_latent_params(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.encoder(x)
+        return self._get_latent_params_from_h(hidden)
 
     def _reparameterize(
             self,

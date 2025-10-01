@@ -17,6 +17,8 @@ class BaseVAE(nn.Module, ABC):
         n_latent: int,
         n_hidden: int = 64,
         n_layers: int = 2,
+        n_batches: int = 0,
+        batch_emb_dim: int = 8
     ):
         super().__init__()
         self.n_input = n_input
@@ -38,7 +40,15 @@ class BaseVAE(nn.Module, ABC):
             n_layers=n_layers,
             activation=nn.ReLU()
         )
-        
+        self.n_batches = int(n_batches)
+        self.batch_emb_dim = int(batch_emb_dim)
+        if self.n_batches > 0:
+            self.batch_emb = nn.Embedding(self.n_batches, self.batch_emb_dim)
+            # adapt encoder features: [h, b] -> h̃  (same width as h)
+            self.enc_cond = nn.Linear(n_hidden + self.batch_emb_dim, n_hidden)
+            # adapt decoder input:   [z, b] -> z̃  (same width as z)
+            self.dec_cond = nn.Linear(self.n_latent + self.batch_emb_dim, self.n_latent)
+
         # Output layers for Negative Binomial distribution
         # Mean parameter
         self.px_scale_decoder = nn.Sequential(nn.Linear(n_hidden, n_input), nn.Softmax(dim=-1))
@@ -68,6 +78,14 @@ class BaseVAE(nn.Module, ABC):
         Must be implemented by subclasses.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def _get_latent_params_from_h(self, h: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """
+        Encodes input to the parameters of the latent distribution.
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def _reparameterize(self, *params) -> torch.Tensor:
@@ -85,21 +103,33 @@ class BaseVAE(nn.Module, ABC):
         """
         raise NotImplementedError
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x: torch.Tensor, batch_index: torch.Tensor | None = None) -> dict:
         """
         Forward pass through the VAE.
         """
         # 1. Get library size factor for NB loss
         library = torch.sum(x, dim=1, keepdim=True).clamp_min(1e-8)
-        
-        # 2. Encode and get latent parameters
-        latent_params = self._get_latent_params(x)
+        # 2) shared encoder features (optionally batch-conditioned)
+        h = self.encoder(x)  # (B, n_hidden)
+        b = None
+        if (self.n_batches > 0) and (batch_index is not None):
+            if batch_index.dtype != torch.long:
+                batch_index = batch_index.long()
+            b = self.batch_emb(batch_index)  # (B, E)
+            h = self.enc_cond(torch.cat([h, b], dim=1))  # (B, n_hidden)
+
+        # 3) latent params
+        try:
+            latent_params = self._get_latent_params_from_h(h)
+        except NotImplementedError:
+            # Fallback: subclass didn’t implement the hook; it will call self.encoder(x) internally.
+            latent_params = self._get_latent_params(x)
         
         # 3. Sample from latent space
         z = self._reparameterize(*latent_params)
         
-        # 4. Decode
-        hidden_decoder = self.decoder(z)
+        z_in = z if b is None else self.dec_cond(torch.cat([z, b], dim=1))
+        hidden_decoder = self.decoder(z_in)
         
         # 5. Get reconstruction distribution parameters
         # Mean of the NB distribution
