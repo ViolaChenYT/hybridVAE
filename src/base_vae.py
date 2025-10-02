@@ -99,11 +99,11 @@ class BaseVAE(nn.Module, ABC):
         """
         raise NotImplementedError
     
-    @abstractmethod
     def _get_latent_params_from_h(self, h: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         """
-        Encodes input to the parameters of the latent distribution.
-        Must be implemented by subclasses.
+        Encodes hidden representation to the parameters of the latent distribution.
+        Default implementation raises NotImplementedError to trigger fallback to _get_latent_params.
+        Subclasses can override this for optimization to avoid redundant encoder forward passes.
         """
         raise NotImplementedError
 

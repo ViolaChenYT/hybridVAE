@@ -226,7 +226,7 @@ def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None, early
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         if loss < best - 1e-4:
-            best = loss; bad = 0; torch.save(model.state_dict(), "best.pt)")
+            best = loss; bad = 0; torch.save(model.state_dict(), "best.pt")
         else: bad += 1
         if early_stopping and bad > patience:
             print(f"Early stopping at epoch {epoch}")
