@@ -53,6 +53,11 @@ class GMVAE(BaseVAE):
         self.enc_z = nn.Linear(n_hidden, 2 * n_latent * n_components)
         # placeholder for extra nonlinearity???
         self.qz_act = nn.Identity()  # placeholder for extra nonlinearity???
+        
+        # Initialize enc_c for uniform component usage
+        with torch.no_grad():
+            self.enc_c.weight.zero_()
+            self.enc_c.bias.zero_()  # for uniform p(c); if non-uniform, set to log π
 
 
     def _get_latent_params_from_h(self, h: torch.Tensor, residual_mean_pen = False, hard_fix = False) -> Tuple[torch.Tensor, torch.Tensor]:  
@@ -70,34 +75,35 @@ class GMVAE(BaseVAE):
         hidden = self.encoder(x)
         return self._get_latent_params_from_h(hidden)
 
-    def _reparameterize(
-            self,
-            logits_c: torch.Tensor,
-            mu_q: torch.Tensor,
-            logvar_q: torch.Tensor,
-        ) -> torch.Tensor:
-            """
-            Sample c ~ q(c|x), then z ~ q(z|x,c). Return z to the decoder.
+    def _reparameterize(self, logits_c, mu_q, logvar_q):
+        # Moment-matched Gaussian for q(z|x) = sum_k q_k N(mu_q, diag(var_q))
+        probs = torch.softmax(logits_c, dim=-1)                     # (B,K)
+        m = (probs.unsqueeze(-1) * mu_q).sum(dim=1)                 # (B,d)
+        second = (probs.unsqueeze(-1) * (torch.exp(logvar_q) + mu_q**2)).sum(dim=1)
+        v = (second - m**2).clamp_min(1e-8)
+        eps = torch.randn_like(m)
+        return m + torch.sqrt(v) * eps
 
-            Inputs:
-            logits_c : (B, K)
-            mu_q     : (B, K, d)
-            logvar_q : (B, K, d)
-            Output:
-            z        : (B, d)
-            """
-            q_c = Categorical(logits=logits_c)                     # distribution over components
-            c = q_c.sample()                                       # (B,)
-            batch_size = logits_c.shape[0]
-            idx = c.view(batch_size, 1, 1).expand(batch_size, 1, self.n_latent)      # (B, 1, d)
+    def _kl_divergence_split(self, logits_c, mu_q, logvar_q):
+        """Return (kl_c, kl_z) separately, each shape (B,)."""
+        q_c = torch.distributions.Categorical(logits=logits_c)
+        p_c = torch.distributions.Categorical(
+            logits=self.prior_cat_logits.expand_as(logits_c)
+        )
+        kl_c = torch.distributions.kl.kl_divergence(q_c, p_c)            # (B,)
 
-            mu_q_s = torch.gather(mu_q, 1, idx).squeeze(1)         # (B, d)
-            logvar_q_s = torch.gather(logvar_q, 1, idx).squeeze(1) # (B, d)
-            std_q_s = torch.exp(0.5 * logvar_q_s)
+        # Gaussian expected KL same as your _kl_divergence
+        var_q  = torch.exp(logvar_q)                                     # (B,K,d)
+        logvp  = 2.0 * self.log_sigma_p                                  # scalar
+        var_p  = torch.exp(logvp)
+        mu_p   = self.mu_prior.unsqueeze(0)                               # (1,K,d)
+        term   = (logvp - logvar_q) + (var_q + (mu_q - mu_p)**2)/var_p - 1.0
+        kl_z_given_c = 0.5 * term.sum(dim=-1)                             # (B,K)
 
-            eps = torch.randn_like(std_q_s)
-            z = mu_q_s + std_q_s * eps                             # (B, d)
-            return z
+        probs = q_c.probs                                                 # (B,K)
+        kl_z  = (probs * kl_z_given_c).sum(dim=1)                         # (B,)
+
+        return kl_c, kl_z
 
     def _kl_divergence(
         self,
@@ -109,40 +115,76 @@ class GMVAE(BaseVAE):
         KL(q(c|x)||p(c)) + E_{q(c|x)} KL(q(z|x,c) || N(mu_c, sigma_p^2 I)).
         Returns shape (B,).
         """
-        # ---- KL for the categorical ----
-        q_c = Categorical(logits=logits_c)
-        p_c = Categorical(logits=self.prior_cat_logits.expand_as(logits_c))
-        kl_c = torch.distributions.kl.kl_divergence(q_c, p_c)                  # (B,)
-
-        # ---- Expected KL between Gaussians per component (closed form) ----
-        var_q = torch.exp(logvar_q)                                            # (B, K, d)
-        logvar_p = 2.0 * self.log_sigma_p                                      # scalar tensor
-        var_p = torch.exp(logvar_p)                                            # scalar
-        mu_p = self.mu_prior.unsqueeze(0)                                      # (1, K, d)
-
-        # 0.5 * sum_d [ log(var_p/var_q) + (var_q + (mu_q - mu_p)^2)/var_p - 1 ]
-        term = (logvar_p - logvar_q) + (var_q + (mu_q - mu_p) ** 2) / var_p - 1.0
-        kl_z_given_c = 0.5 * term.sum(dim=-1)                                  # (B, K)
-
-        probs_c = q_c.probs                                                    # (B, K)
-        kl_z = (probs_c * kl_z_given_c).sum(dim=1)                             # (B,)
-
+        kl_c, kl_z = self._kl_divergence_split(logits_c, mu_q, logvar_q)
         return kl_c + kl_z
+    def _expected_recon_over_c(self, x, logits_c, mu_q, logvar_q):
+        """
+        Computes E_{q(c|x)} E_{q(z|x,c)} [ -log p(x|z) ]
+        by enumerating all K components (low variance).
+        Returns per-sample recon loss, shape (B,).
+        """
+        B, K, d = mu_q.shape
+        device = x.device
 
-    def loss(self, x, forward_output, aggregate_alignment_pen=False, residual_mean_pen=False, kl_weight=1.0, align_weight=5e-2,anchor_weight=1e-2):
-        base = super().loss(x, forward_output, kl_weight)
-        logits_c, mu_q, _ = forward_output["latent_params"]           # (B,K,d) 
+        # responsibilities
+        probs = torch.softmax(logits_c, dim=-1)                 # (B,K)
+
+        # sample z for each component (1 sample per k is plenty here)
+        std = torch.exp(0.5 * logvar_q)                         # (B,K,d)
+        eps = torch.randn_like(std)
+        z_k = mu_q + std * eps                                   # (B,K,d)
+
+        # decode each (B,K,d) → (B*K, d) → decode → NB params → reshape back
+        z_flat = z_k.reshape(B * K, d)
+        h_dec  = self.decoder(z_flat)                            # (B*K, hidden)
+        px_scale = self.px_scale_decoder(h_dec)                  # (B*K, G)
+        px_r     = torch.nn.functional.softplus(self.px_r_decoder(h_dec)) + 1e-6
+        px_scale = px_scale.clamp(1e-8, 1.0)
+        px_r     = px_r.clamp(1e-6, 1e6)
+
+        # library sizes per sample (B,1) broadcast to (B,K,G)
+        library = x.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        px_rate = (library.repeat(1, K)[:, :, None] * px_scale.view(B, K, -1)).clamp(1e-8, 1e12)  # (B,K,G)
+        px_r    = px_r.view(B, K, -1)                                                               # (B,K,G)
+
+        # NB log prob for each k, then expectation over c with weights probs
+        # log p(x|z_k) summed over genes → (B,K)
+        from torch.distributions import NegativeBinomial
+        x_expand = x[:, None, :].expand_as(px_rate)                                                 # (B,K,G)
+        logits = (px_r.clamp_min(1e-8)).log() - (px_rate.clamp_min(1e-8)).log()
+        logp_x_given_zk = NegativeBinomial(total_count=px_r, logits=logits).log_prob(x_expand).sum(-1)  # (B,K)
+
+        # E_{q(c|x)}[ -log p(x|z) ]  (minus sign for loss)
+        recon = -(probs * logp_x_given_zk).sum(dim=1)                                               # (B,)
+        return recon
+
+
+    def loss(self, x, forward_output, kl_weight=1.0,
+         aggregate_alignment_pen=False, residual_mean_pen=False,
+         align_weight=5e-2, anchor_weight=1e-2):
+        logits_c, mu_q, logvar_q = forward_output["latent_params"]
+
+        # low-variance reconstruction (expected over c)
+        recon_loss = self._expected_recon_over_c(x, logits_c, mu_q, logvar_q)  # (B,)
+
+        # KL as you already derive (categorical + expected Gaussian)
+        kl_local = self._kl_divergence(logits_c, mu_q, logvar_q)               # (B,)
+
+        loss = (recon_loss + kl_weight * kl_local).mean()
+        out = {"loss": loss, "recon_loss": recon_loss.mean(), "kl_local": kl_local.mean()}
+
+        # optional regularizers you already implemented
         if residual_mean_pen:
             resid = mu_q - self.mu_prior.unsqueeze(0)
             anchor = (resid ** 2).mean()
-            base["loss"] = base["loss"] + anchor_weight * anchor
-            base["anchor"] = anchor.detach()
+            loss = loss + anchor_weight * anchor
+            out.update({"loss": loss, "anchor": anchor.detach()})
         if aggregate_alignment_pen:
-            probs = torch.distributions.Categorical(logits=logits_c).probs  # (B,K)
-            denom = probs.sum(dim=0, keepdim=True).clamp_min(1e-8)        # (1,K)
-            w = (probs / denom).unsqueeze(-1)                              # (B,K,1)
-            mu_bar = (w * mu_q).sum(dim=0)                                 # (K,d)
-            align = ((mu_bar - self.mu_prior) ** 2).sum(dim=-1).mean()
-            base["loss"] = base["loss"] + align_weight * align
-            base["align"] = align.detach()
-        return base
+            probs = torch.softmax(logits_c, -1)
+            denom = probs.sum(0, keepdim=True).clamp_min(1e-8)
+            mu_bar = ((probs / denom).unsqueeze(-1) * mu_q).sum(0)
+            align = ((mu_bar - self.mu_prior) ** 2).sum(-1).mean()
+            loss = loss + align_weight * align
+            out.update({"loss": loss, "align": align.detach()})
+        return out
+

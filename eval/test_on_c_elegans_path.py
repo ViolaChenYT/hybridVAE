@@ -20,24 +20,13 @@ from circular_vae import CircularVAE
 from base_vae import BaseVAE
 from vae import VAE
 from utils import *
+from trainer import Trainer, set_seed
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import argparse
 import seaborn as sns
 
-def set_seed(seed: int = 42):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    # cuDNN / backends
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-    # Strong determinism (may error if an op has no deterministic impl)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+# set_seed function is now imported from trainer module
 set_seed()
 
 def load_h5ad_data(file_path, label_key):
@@ -165,14 +154,17 @@ def batch_iter(X, batch_index, batch_size: int, shuffle: bool = True):
         else:
             yield xb, batch_index[idx]
 
-def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None, early_stopping=True):
+def train_gmvae(X_tensor, fixed_means, args, n_batches=0, batch_index=None, early_stopping=True):
     """
-    Train GMVAE model.
+    Train GMVAE model using the Trainer class.
     
     Args:
         X_tensor (torch.Tensor): Input data
         fixed_means (torch.Tensor): Fixed prior means
         args: Command line arguments
+        n_batches: Number of batches for batch correction
+        batch_index: Batch indices
+        early_stopping: Whether to use early stopping
     
     Returns:
         tuple: (trained_model, loss_history, kl_weight_history)
@@ -181,9 +173,13 @@ def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None, early
     print(f"Input dimension: {X_tensor.shape[1]}")
     print(f"Latent dimension: {args.n_latent}")
     print(f"Number of components: {len(fixed_means)}")
-    if torch.cuda.is_available(): device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available(): device = torch.device("mps")
-    else: device = torch.device("cpu")
+    
+    if torch.cuda.is_available(): 
+        device = torch.device("cuda")
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available(): 
+        device = torch.device("mps")
+    else: 
+        device = torch.device("cpu")
 
     # Initialize model
     model = GMVAE(
@@ -193,56 +189,13 @@ def train_gmvae(X_tensor, fixed_means, args, n_batches=0,batch_index=None, early
         n_batches=n_batches,
         batch_emb_dim=8,
         batch_index=batch_index
-    )
+    ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Use Trainer class
+    trainer = Trainer(model, device, args, "GMVAE")
+    results = trainer.train(X_tensor, batch_index=batch_index, early_stopping=early_stopping)
     
-    # Training parameters
-    n_epochs = args.n_epochs
-    n_warmup_epochs = args.n_warmup_epochs
-    kl_weight = 0.0
-    
-    # Lists for tracking
-    loss_history = []
-    kl_weight_history = []
-    
-    print(f"Starting training for {n_epochs} epochs...")
-    best = float("inf");bad=0;patience = 80
-    for epoch in range(n_epochs):
-        model.train()
-
-        # KL weight annealing
-        if epoch < n_warmup_epochs:
-            kl_weight = args.prior_weight * epoch / n_warmup_epochs
-        else:
-            kl_weight = args.prior_weight
-
-        kl_weight_history.append(kl_weight)
-        optimizer.zero_grad()
-        out = model(X_tensor, batch_index=batch_index)                  # <- pass experimental batch vector here
-        loss_dict = model.loss(X_tensor, out, kl_weight=kl_weight)
-        loss = loss_dict["loss"]
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        if loss < best - 1e-4:
-            best = loss; bad = 0; torch.save(model.state_dict(), "best.pt")
-        else: bad += 1
-        if early_stopping and bad > patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-        
-        if (epoch + 1) % args.print_every == 0:
-            print(
-                f"Epoch [{epoch+1}/{n_epochs}], "
-                f"Loss: {loss.item():.4f}, "
-                f"KL Weight: {kl_weight:.2f}, "
-                f"Recon Loss: {loss_dict['recon_loss']:.4f}, "
-                f"KL Local: {loss_dict['kl_local']:.4f}"
-            )
-    
-    print("Training completed!")
-    return model, loss_history, kl_weight_history
+    return results['model'], results['loss_history'], results['kl_weight_history']
 
 def plot_1d_latent_space(model, X_tensor, labels, args, batch_index=None):
     """
@@ -386,6 +339,12 @@ if __name__ == "__main__":
                        help="Number of components (if not specified, inferred from prior_values)")
     parser.add_argument("--prior_sigma", type=float, default=0.05,
                        help="Prior sigma (not used in current implementation)")
+    
+    # GMVAE stabilization arguments
+    parser.add_argument("--entropy_warmup_epochs", type=int, default=20,
+                       help="Epochs to keep a small entropy bonus on q(c|x)")
+    parser.add_argument("--lambda_entropy", type=float, default=1e-3,
+                       help="Weight for early entropy bonus on q(c|x)")
     
     args = parser.parse_args()
     print("parsed args: ", args)

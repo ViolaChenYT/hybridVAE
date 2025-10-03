@@ -38,21 +38,9 @@ if module_path not in sys.path:
 from gmvae import GMVAE
 from vae import VAE
 from circular_vae import CircularVAE
+from trainer import Trainer, set_seed
 
-def set_seed(seed: int = 42):
-    """Set random seeds for reproducibility."""
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    
-    # cuDNN / backends
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    
-    # Strong determinism (may error if an op has no deterministic impl)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+# set_seed function is now imported from trainer module
 
 @torch.no_grad()
 def generate_clustered_nb_1d(
@@ -182,161 +170,9 @@ def generate_clustered_nb_2d(
 
     return X, labels.cpu(), z.cpu()
 
-def train_model(model, X, args, model_name="Model"):
-    """
-    Train a VAE or GMVAE model.
-    
-    Args:
-        model: The model to train
-        X: Input data tensor
-        args: Command line arguments
-        model_name: Name for logging
-    
-    Returns:
-        model: Trained model
-        losses_history: List of loss dictionaries
-    """
-    print(f"\n=== Training {model_name} ===")
-    
-    device = next(model.parameters()).device
-    dl = DataLoader(TensorDataset(X.float()), batch_size=args.batch_size, shuffle=True)
-    opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+# train_model function is now replaced by Trainer class
 
-    def fit_step(model, xb, kl_w):
-        fwd = model(xb)
-        losses = model.loss(xb, fwd, kl_weight=kl_w)
-        return losses
-
-    model.train()
-    losses_history = []
-    
-    print(f"Starting training for {args.n_epochs} epochs...")
-    for ep in range(1, args.n_epochs + 1):
-        kl_w = min(1.0, ep / args.kl_warmup_epochs)
-        tot = 0.0
-        n = 0
-        epoch_losses = {}
-        
-        for (xb,) in dl:
-            xb = xb.to(device).float()
-            opt.zero_grad()
-            losses = fit_step(model, xb, kl_w)
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            
-            # Accumulate losses
-            for key, value in losses.items():
-                if key not in epoch_losses:
-                    epoch_losses[key] = 0.0
-                epoch_losses[key] += value.item() * xb.size(0)
-            
-            tot += losses["loss"].item() * xb.size(0)
-            n += xb.size(0)
-        
-        # Average losses
-        for key in epoch_losses:
-            epoch_losses[key] /= n
-        losses_history.append(epoch_losses)
-        
-        if ep == 1 or ep % args.print_every == 0 or ep == args.n_epochs:
-            print(f"[{ep:03d}] loss={tot/n:.3f}  kl_w={kl_w:.2f}  "
-                  f"recon={epoch_losses.get('recon_loss', 0):.3f}  "
-                  f"kl={epoch_losses.get('kl_local', 0):.3f}")
-    
-    print(f"{model_name} training completed!")
-    return model, losses_history
-
-def evaluate_model(model, X, labels, Z_true, model_name="Model"):
-    """
-    Evaluate a trained model and return metrics.
-    
-    Args:
-        model: Trained model
-        X: Input data tensor
-        labels: True cluster labels
-        Z_true: True latent values
-        model_name: Name for logging
-    
-    Returns:
-        dict: Evaluation metrics
-    """
-    print(f"\n=== Evaluating {model_name} ===")
-    
-    model.eval()
-    device = next(model.parameters()).device
-    
-    with torch.no_grad():
-        if isinstance(model, GMVAE):
-            # GMVAE evaluation
-            latent_params = model._get_latent_params(X.float().to(device))
-            logits_c, mu_q, logvar_q = latent_params
-            
-            # Get cluster assignments
-            cluster_probs = torch.softmax(logits_c, dim=-1)
-            predicted_clusters = torch.argmax(cluster_probs, dim=-1)
-            
-            # Get latent representations (mean of most likely component)
-            batch_size = logits_c.shape[0]
-            idx = predicted_clusters.view(batch_size, 1, 1).expand(batch_size, 1, model.n_latent)
-            enc_mu = torch.gather(mu_q, 1, idx).squeeze(1)
-            
-            # Move to CPU
-            enc_mu = enc_mu.cpu()
-            predicted_clusters = predicted_clusters.cpu()
-            cluster_probs = cluster_probs.cpu()
-            
-            # Clustering metrics
-            ari = adjusted_rand_score(labels.numpy(), predicted_clusters.numpy())
-            nmi = normalized_mutual_info_score(labels.numpy(), predicted_clusters.numpy())
-            cm = confusion_matrix(labels.numpy(), predicted_clusters.numpy())
-            
-            metrics = {
-                'enc_mu': enc_mu,
-                'predicted_clusters': predicted_clusters,
-                'cluster_probs': cluster_probs,
-                'ari': ari,
-                'nmi': nmi,
-                'confusion_matrix': cm,
-                'mean_confidence': torch.mean(torch.max(cluster_probs, dim=1)[0]).item()
-            }
-            
-        else:
-            # VAE evaluation
-            mu, logvar = model._get_latent_params(X.float().to(device))
-            enc_mu = mu.cpu()
-            
-            metrics = {
-                'enc_mu': enc_mu,
-                'predicted_clusters': None,
-                'cluster_probs': None,
-                'ari': None,
-                'nmi': None,
-                'confusion_matrix': None,
-                'mean_confidence': None
-            }
-    
-    # Latent space recovery metrics
-    correlation, p_value = pearsonr(Z_true.numpy().flatten(), enc_mu.numpy().flatten())
-    residuals = enc_mu.numpy().flatten() - Z_true.numpy().flatten()
-    
-    metrics.update({
-        'correlation': correlation,
-        'p_value': p_value,
-        'rmse': np.sqrt(np.mean(residuals**2)),
-        'mean_residual': np.mean(residuals),
-        'std_residual': np.std(residuals)
-    })
-    
-    print(f"{model_name} evaluation completed:")
-    print(f"  Latent space correlation: {correlation:.4f}")
-    print(f"  RMSE: {metrics['rmse']:.4f}")
-    if metrics['ari'] is not None:
-        print(f"  ARI: {metrics['ari']:.4f}")
-        print(f"  NMI: {metrics['nmi']:.4f}")
-        print(f"  Mean cluster confidence: {metrics['mean_confidence']:.4f}")
-    
-    return metrics
+# evaluate_model function is now replaced by Trainer.evaluate method
 
 def plot_training_losses(gmvae_losses=None, vae_losses=None, save_path=None):
     """Plot training losses."""
@@ -720,7 +556,6 @@ def run_simulation(args):
     
     # Train GMVAE
     if args.model_type in ['gmvae', 'both']:
-        print(f"\n=== Training GMVAE ===")
         if args.latent_dim == 1:
             # Use true cluster centers for 1D
             fixed_means = true_centers
@@ -742,12 +577,14 @@ def run_simulation(args):
             likelihood="nb"
         ).to(device)
         
-        gmvae_model, gmvae_losses = train_model(gmvae_model, X, args, "GMVAE")
-        gmvae_metrics = evaluate_model(gmvae_model, X, labels, Z_true, "GMVAE")
+        gmvae_trainer = Trainer(gmvae_model, device, args, "GMVAE")
+        gmvae_results = gmvae_trainer.train(X)
+        gmvae_model = gmvae_results['model']
+        gmvae_losses = gmvae_results['loss_history']
+        gmvae_metrics = gmvae_trainer.evaluate(X, labels, Z_true)
     
     # Train VAE
     if args.model_type in ['vae', 'both']:
-        print(f"\n=== Training VAE ===")
         vae_model = VAE(
             n_input=args.n_features,
             n_latent=args.latent_dim,
@@ -756,8 +593,11 @@ def run_simulation(args):
             likelihood="nb"
         ).to(device)
         
-        vae_model, vae_losses = train_model(vae_model, X, args, "VAE")
-        vae_metrics = evaluate_model(vae_model, X, labels, Z_true, "VAE")
+        vae_trainer = Trainer(vae_model, device, args, "VAE")
+        vae_results = vae_trainer.train(X)
+        vae_model = vae_results['model']
+        vae_losses = vae_results['loss_history']
+        vae_metrics = vae_trainer.evaluate(X, labels, Z_true)
     
     # Plotting and analysis
     print(f"\n=== Generating Visualizations ===")
@@ -771,18 +611,18 @@ def run_simulation(args):
                                 args.latent_dim,
                                 save_path=args.save_plots + "_latent_comparison.png" if args.save_plots else None)
     
-    # Encoded latent distribution plots
+    # Encoded latent distribution plots using Trainer methods
     if gmvae_metrics:
-        plot_encoded_latent_distribution(gmvae_metrics, labels, "GMVAE",
+        gmvae_trainer.plot_encoded_latent_distribution(gmvae_metrics, labels,
                                        save_path=args.save_plots + "_gmvae_latent_distribution.png" if args.save_plots else None)
     
     if vae_metrics:
-        plot_encoded_latent_distribution(vae_metrics, labels, "VAE",
+        vae_trainer.plot_encoded_latent_distribution(vae_metrics, labels,
                                        save_path=args.save_plots + "_vae_latent_distribution.png" if args.save_plots else None)
     
     # Clustering analysis (GMVAE only)
     if gmvae_metrics:
-        plot_clustering_analysis(gmvae_metrics, labels,
+        gmvae_trainer.plot_clustering_analysis(gmvae_metrics, labels,
                                save_path=args.save_plots + "_clustering_analysis.png" if args.save_plots else None)
     
     # Print summary
@@ -819,11 +659,11 @@ if __name__ == "__main__":
                        help="Number of hidden units")
     parser.add_argument("--n_layers", '-L', type=int, default=2,
                        help="Number of hidden layers")
-    parser.add_argument("--prior_sigma", type=float, default=0.25,
+    parser.add_argument("--prior_sigma", type=float, default=0.2,
                        help="Prior sigma for GMVAE")
     
     # Training arguments
-    parser.add_argument("--n_epochs", '-e', type=int, default=500,
+    parser.add_argument("--n_epochs", '-e', type=int, default=300,
                        help="Number of training epochs")
     parser.add_argument("--kl_warmup_epochs", type=int, default=50,
                        help="Number of warmup epochs for KL annealing")
@@ -839,6 +679,12 @@ if __name__ == "__main__":
                        help="Random seed")
     parser.add_argument("--save_plots", type=str, default=None,
                        help="Prefix for saving plots (if None, plots are not saved)")
+    
+    # GMVAE stabilization arguments
+    parser.add_argument("--entropy_warmup_epochs", type=int, default=20,
+                       help="Epochs to keep a small entropy bonus on q(c|x)")
+    parser.add_argument("--lambda_entropy", type=float, default=1e-3,
+                       help="Weight for early entropy bonus on q(c|x)")
     
     args = parser.parse_args()
     
