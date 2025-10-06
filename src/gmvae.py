@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.distributions import Normal, Categorical
 from base_vae import BaseVAE
 from typing import Tuple, Dict
+import pdb
 
 class GMVAE(BaseVAE):
     """
@@ -23,8 +24,9 @@ class GMVAE(BaseVAE):
         self,
         n_input: int,
         n_latent: int,
-        fixed_means: torch.Tensor, # Shape: (n_components, n_latent)
-        prior_sigma: float = 0.2, # shared across all clusters
+        n_components: int,
+        fixed_means: torch.Tensor | None = None, # Shape: (n_components, n_latent)
+        prior_sigma: float | None = None, # shared across all clusters
         n_batches: int = 0,
         batch_emb_dim: int = 8,
         batch_index: torch.Tensor | None = None,
@@ -35,14 +37,45 @@ class GMVAE(BaseVAE):
     ):
         super().__init__(n_input, n_latent, n_hidden, n_layers, likelihood, n_batches=n_batches, batch_emb_dim=batch_emb_dim)
 
-        n_components, d = fixed_means.shape
-        assert d == n_latent, "fixed_means dim must equal n_latent"
         self.n_components = n_components
         self.n_latent = n_latent
+        self.prior_sigma = prior_sigma
+        self.fixed_means = fixed_means
+        if self.fixed_means is not None:
+            n_parts, d = fixed_means.shape
+            assert d == n_latent, "fixed_means dim must equal n_latent"
+            assert n_parts == n_components, "fixed_means rows must equal n_components"
         
         # Register fixed means and other prior parameters
-        self.register_buffer("mu_prior", fixed_means)
-        self.register_buffer("log_sigma_p", torch.tensor(math.log(prior_sigma)))
+        #self.register_buffer("mu_prior", fixed_means)
+
+        self.c_encoder = self._build_network(
+            n_in=1,
+            n_out=32,
+            n_hidden=32,
+            n_layers=1,
+            activation=nn.ReLU()
+        )
+        self.p_zgivenc = nn.Linear(32, 2*n_latent)
+        if fixed_means is not None:
+            self.register_buffer("mu_prior", fixed_means)
+        if prior_sigma is not None:
+            self.register_buffer("log_sigma_p", torch.tensor(math.log(prior_sigma)))
+        '''
+        if prior_sigma is None and fixed_means is None:
+            #self.register_buffer("log_sigma_p", torch.tensor(math.log(prior_sigma)))
+            self.c_encoder = self._build_network(
+                n_in=1,
+                n_out=32,
+                n_hidden=32,
+                n_layers=1,
+                activation=nn.ReLU()
+            )
+            self.p_zgivenc = nn.Linear(32, 2*n_latent)
+        else:
+            self.register_buffer("mu_prior", fixed_means)
+            self.register_buffer("log_sigma_p", torch.tensor(math.log(prior_sigma)))
+        '''
         p_logits = torch.zeros(self.n_components) if prior_logits is None else prior_logits
         self.register_buffer("prior_cat_logits", p_logits)
 
@@ -94,14 +127,39 @@ class GMVAE(BaseVAE):
 
         # Gaussian expected KL same as your _kl_divergence
         var_q  = torch.exp(logvar_q)                                     # (B,K,d)
-        logvp  = 2.0 * self.log_sigma_p                                  # scalar
-        var_p  = torch.exp(logvp)
-        mu_p   = self.mu_prior.unsqueeze(0)                               # (1,K,d)
+        #pdb.set_trace()
+        c_input = torch.tensor([i for i in range(self.n_components)], device=logits_c.device).unsqueeze(1).float()  # (K,1)
+        h_c = self.c_encoder(c_input)  # (K,32)
+        mu_p, logvp = torch.chunk(self.p_zgivenc(h_c), 2, dim=-1)  # each (K,d)
+        mu_p = mu_p.unsqueeze(0)                                         # (1,K,d)
+        logvp = logvp.clamp(-10.0, 10.0).unsqueeze(0)           # (1,K,d)
+        var_p = torch.exp(logvp)                                 # (1,K,d)
+        if self.prior_sigma is not None:
+            logvp  = 2.0 * self.log_sigma_p                                  # scalar
+            var_p  = torch.exp(logvp)
+        if self.fixed_means is not None:
+            mu_p   = self.mu_prior.unsqueeze(0)                               # (1,K,d)
+        '''
+        if self.prior_sigma is None and self.fixed_means is None:
+            c_input = torch.tensor([i for i in range(self.n_components)], device=logits_c.device).unsqueeze(1).float()  # (K,1)
+            h_c = self.c_encoder(c_input)  # (K,32)
+            mu_p, logvp = torch.chunk(self.p_zgivenc(h_c), 2, dim=-1)  # each (K,d)
+            mu_p = mu_p.unsqueeze(0)                                         # (1,K,d)
+            logvp = logvp.clamp(-10.0, 10.0).unsqueeze(0)           # (1,K,d)
+            var_p = torch.exp(logvp)                                 # (1,K,d)
+        else:
+            logvp  = 2.0 * self.log_sigma_p                                  # scalar
+            var_p  = torch.exp(logvp)
+            mu_p   = self.mu_prior.unsqueeze(0)                               # (1,K,d)
+        '''
         term   = (logvp - logvar_q) + (var_q + (mu_q - mu_p)**2)/var_p - 1.0
         kl_z_given_c = 0.5 * term.sum(dim=-1)                             # (B,K)
 
         probs = q_c.probs                                                 # (B,K)
         kl_z  = (probs * kl_z_given_c).sum(dim=1)                         # (B,)
+
+        #print("KL components:")
+        #print(kl_c.mean().item(), kl_z.mean().item())
 
         return kl_c, kl_z
 
@@ -159,7 +217,7 @@ class GMVAE(BaseVAE):
         return recon
 
 
-    def loss(self, x, forward_output, kl_weight=1.0,
+    def loss(self, x, forward_output, kl_c_weight=1.0, kl_z_weight=1.0,
          aggregate_alignment_pen=False, residual_mean_pen=False,
          align_weight=5e-2, anchor_weight=1e-2):
         logits_c, mu_q, logvar_q = forward_output["latent_params"]
@@ -168,10 +226,13 @@ class GMVAE(BaseVAE):
         recon_loss = self._expected_recon_over_c(x, logits_c, mu_q, logvar_q)  # (B,)
 
         # KL as you already derive (categorical + expected Gaussian)
-        kl_local = self._kl_divergence(logits_c, mu_q, logvar_q)               # (B,)
+        #kl_local = self._kl_divergence(logits_c, mu_q, logvar_q)               # (B,)
+        kl_c, kl_z = self._kl_divergence_split(logits_c, mu_q, logvar_q)
 
-        loss = (recon_loss + kl_weight * kl_local).mean()
-        out = {"loss": loss, "recon_loss": recon_loss.mean(), "kl_local": kl_local.mean()}
+        loss = (recon_loss + kl_c_weight * kl_c + kl_z_weight * kl_z).mean()
+        #print("Loss components:")
+        #print(recon_loss.mean().item(), kl_local.mean().item())
+        out = {"loss": loss, "recon_loss": recon_loss.mean(), "kl_c": kl_c.mean(), "kl_z": kl_z.mean()}
 
         # optional regularizers you already implemented
         if residual_mean_pen:
