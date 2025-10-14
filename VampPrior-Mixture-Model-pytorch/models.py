@@ -8,12 +8,14 @@ import abc
 from typing import Dict, Any, Tuple, Optional
 import torch.nn.functional as F
 import torch.distributions as td
+from contextlib import contextmanager
+import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def build_encoder(dim_x, h_dim, n_layers, dropout=0.0):
-    layers = [nn.Linear(in_dim, h_dim), nn.ReLU(inplace=True)]
-    if self.dropout > 0:
+    layers = [nn.Linear(dim_x, h_dim), nn.ReLU(inplace=True)]
+    if dropout > 0:
         layers.append(nn.Dropout(dropout))
     for _ in range(n_layers - 1):
         layers += [nn.Linear(h_dim, h_dim), nn.ReLU(inplace=True)]
@@ -55,20 +57,42 @@ def build_decoder(dim_x, latent_dim, h_dim, n_layers, dropout=0.0, device=None):
 
 # ---------- tiny metric helpers ----------
 class RunningMean:
-    def __init__(self):
+    def __init__(self, dtype=torch.float32, device=None):
+        self._dtype = dtype
+        self._device = device
         self.reset()
+
     @torch.no_grad()
-    def update(self, x: torch.Tensor):
-        v = x.detach()
-        self._sum += v.sum()
-        self._count += v.numel()
+    def update(self, x: torch.Tensor | float):
+        # Accept tensor or Python number
+        if isinstance(x, torch.Tensor):
+            v = x.detach().to(device=self._sum.device, dtype=self._sum.dtype)
+            self._sum += v.sum()
+            self._count += torch.tensor(v.numel(), device=self._sum.device, dtype=self._sum.dtype)
+        else:
+            # Python scalar -> convert on the buffer's device/dtype
+            self._sum += torch.tensor(float(x), device=self._sum.device, dtype=self._sum.dtype)
+            self._count += torch.tensor(1.0, device=self._sum.device, dtype=self._sum.dtype)
+
     @torch.no_grad()
     def compute(self) -> torch.Tensor:
         return self._sum / self._count.clamp_min(1.0)
+
     @torch.no_grad()
-    def reset(self):  # scalar buffers
-        self._sum   = torch.tensor(0.0)
-        self._count = torch.tensor(0.0)
+    def reset(self):
+        dev = self._device if self._device is not None else torch.device("cpu")
+        self._sum   = torch.tensor(0.0, device=dev, dtype=self._dtype)
+        self._count = torch.tensor(0.0, device=dev, dtype=self._dtype)
+
+    # Optional convenience: move buffers like a module
+    def to(self, device=None, dtype=None):
+        if device is not None:
+            self._sum = self._sum.to(device)
+            self._count = self._count.to(device)
+        if dtype is not None:
+            self._sum = self._sum.to(dtype=dtype)
+            self._count = self._count.to(dtype=dtype)
+        return self
 
 # ---------- utils ----------
 def softplus_inv(y: torch.Tensor) -> torch.Tensor:
@@ -136,7 +160,8 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         self.decoder = decoder
 
         # q(z|x) head: replace tfpl.MultivariateNormalTriL
-        self.qz_head = MVNTriLHead(in_dim=enc_out_dim, latent_dim=prior.latent_dim)
+        #self.qz_head = MVNTriLHead(in_dim=enc_out_dim, latent_dim=prior.latent_dim)
+        self.qz_head = DiagGaussianHead(in_dim=enc_out_dim, latent_dim=prior.latent_dim)
         self.encoder = encoder
 
         # scale ~ Softplus(raw_scale); init so softplus(raw)=1.0
@@ -188,19 +213,32 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         std = (0.5 * logvar).exp().clamp_min(1e-8)
 
         base = td.Normal(loc=loc, scale=std)
-        reinterpret_ndims = loc.dim() - 1          # treat all non-batch dims as event dims
-        return td.Independent(base, reinterpret_ndims=reinterpret_ndims)
+        reinterpreted_batch_ndims = loc.dim() - 1          # treat all non-batch dims as event dims
+        return td.Independent(base, reinterpreted_batch_ndims=reinterpreted_batch_ndims)
 
-    # ----- ELBO -----
+    @contextmanager
+    def _freeze_params(sefl, module: torch.nn.Module):
+        """Temporarily set requires_grad=False for all params in `module`."""
+        flags = [p.requires_grad for p in module.parameters()]
+        try:
+            for p in module.parameters():
+                p.requires_grad_(False)
+            yield
+        finally:
+            for p, f in zip(module.parameters(), flags):
+                p.requires_grad_(f)
+
     def variational_objective(self, x: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, Any]]:
         qz_x = self._define_variational_family(x, **kwargs)   # MVN
         z = qz_x.rsample()                                    # reparameterized
         px_z = self.px(z, x_shape=x.shape)
         expected_log_lik = px_z.log_prob(x)                   # (B,)
-        dkl = self.prior.kl_divergence(qz_x, encoder=lambda y, **kw: self._define_variational_family(y, **kw))
+        with self._freeze_params(self.prior):
+            dkl = self.prior.kl_divergence(qz_x)
         elbo = expected_log_lik - dkl                         # (B,)
 
         # track
+        #pdb.set_trace()
         self.elbo_tracker.update(elbo.mean())
         self.ell_tracker.update(expected_log_lik.mean())
         self.dkl_tracker.update(dkl.mean())
@@ -211,10 +249,10 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
     # ----- one optimization step (pass optimizer explicitly) -----
     def variational_inference_step(self, x: torch.Tensor, optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
         optimizer.zero_grad(set_to_none=True)
-        loss, vf = self.variational_objective(x, training=True)
+        loss, vf = self.variational_objective(x)
         loss.backward()
         optimizer.step()
-        return vf
+        return loss, vf
 
     # ----- clustering helpers -----
     @torch.no_grad()
@@ -240,7 +278,7 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
     # ----- Keras-style helpers (optional) -----
     @torch.no_grad()
     def train_step(self, data: Dict[str, torch.Tensor], optimizer: torch.optim.Optimizer):
-        vf = self.variational_inference_step(data["x"], optimizer)
+        loss, vf = self.variational_inference_step(data["x"], optimizer)
         self.additional_metrics(data, vf)
         return self.get_metrics_result()
 
@@ -271,14 +309,16 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
         super().__init__(encoder, enc_out_dim, decoder, prior, **kwargs)
 
         # --- split parameters: prior vs model (everything else) ---
-        self._prior_params  = list(self.prior.parameters())
-        self._model_params  = [p for p in self.parameters() if p not in self._prior_params]
+        #self._prior_params  = list(self.prior.parameters())
+        #_prior_ids = {id(p) for p in self._prior_params}
+        #pdb.set_trace()
+        #self._model_params  = [p for p in self.parameters() if p not in _prior_ids]
 
         # sanity: union equals all params (order can differ)
-        assert len(list(self.parameters())) == (len(self._model_params) + len(self._prior_params))
+        #assert len(list(self.parameters())) == (len(self._model_params) + len(self._prior_params))
 
         # a dedicated optimizer for the **model** (user can replace this)
-        self.model_optimizer = torch.optim.Adam(self._model_params, lr=1e-3)
+        self.model_optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
 
     @torch.no_grad()
     def _encoder_no_grad(self, x: torch.Tensor, **kwargs) -> td.Distribution:
@@ -316,7 +356,7 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
         Step 2: update prior parameters via prior.inference_step (EB update).
         """
         # ----- Step 1: model update (no prior params in this optimizer) -----
-        vf = self.variational_inference_step(data["x"], optimizer=self.model_optimizer)
+        loss, vf = self.variational_inference_step(data["x"], optimizer=self.model_optimizer)
 
         # ----- Step 2: prior-only update (prevent grads into encoder) -----
         # Provide a no-grad encoder callable so the prior updates only its params
