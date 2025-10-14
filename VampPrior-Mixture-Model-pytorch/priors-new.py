@@ -365,7 +365,7 @@ class GaussianMixture(ClusteringPrior):
             z = z.unsqueeze(1)                       # (B, 1, D)
         return self.pz_c(**kwargs).log_prob(z)       # broadcast → (B, K)
     '''
-    def inference(self, *, encoder: callable, x: torch.Tensor, em_iters: int = 10, jitter: float = 1e-6, **kwargs):
+    def inference_step(self, *, encoder: callable, x: torch.Tensor, em_iters: int = 10, jitter: float = 1e-6, **kwargs):
         """
         Run EM on latent samples z ~ q(z|x) to (partially) maximize sum_b log p(z_b).
         Updates self.pi_logits, self.mu, and the precision Cholesky (via self.L).
