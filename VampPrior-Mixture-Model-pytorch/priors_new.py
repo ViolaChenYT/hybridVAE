@@ -443,8 +443,8 @@ class GaussianMixture(ClusteringPrior):
             # and self.L is the unconstrained nn.Parameter such that self.chol_precision() == self.to_chol(self.L)
             with torch.no_grad():
                 self.raw_L.data.copy_(self.to_chol.inv(R))
-            ll = self.pz().log_prob(z).sum()
-            print(ll.item())
+        ll = self.pz().log_prob(z).sum()
+        #print(ll.item())
         return {"resp": resp, "Nk": Nk, "ll": ll}
 
 
