@@ -10,6 +10,7 @@ from torch.distributions import MixtureSameFamily
 
 import math
 from typing import Union, Tuple, Any
+import pdb
 
 def softplus(x: torch.Tensor) -> torch.Tensor:
     return F.softplus(x)
@@ -366,6 +367,15 @@ class GaussianMixture(ClusteringPrior):
             z = z.unsqueeze(1)                       # (B, 1, D)
         return self.pz_c(**kwargs).log_prob(z)       # broadcast → (B, K)
     '''
+    def log_prob_c_z(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        comp = self.pz_c()                                      # batch K MultivariateNormals
+        log_pzk = comp.log_prob(z)                            # (B, K)
+        log_pi  = F.log_softmax(self.pi_logits, dim=-1)         # (K,)
+        log_num = log_pi + log_pzk                              # (B, K)
+        log_den = torch.logsumexp(log_num, dim=-1, keepdim=True)
+        resp    = torch.exp(log_num - log_den)                  # γ_{bk} (B, K)
+        return resp
+
     def inference_step(self, *, encoder: callable, x: torch.Tensor, em_iters: int = 10, jitter: float = 1e-6, **kwargs):
         """
         Run EM on latent samples z ~ q(z|x) to (partially) maximize sum_b log p(z_b).
@@ -378,6 +388,7 @@ class GaussianMixture(ClusteringPrior):
         Returns:
             dict with responsibilities 'resp' (B, K) and current log-likelihood 'll'
         """
+        #pdb.set_trace()
         # ---- sample latent points ----
         z = encoder(x, **kwargs).sample()           # (B, D)
         if z.dim() == 2:
@@ -391,12 +402,7 @@ class GaussianMixture(ClusteringPrior):
 
         for _ in range(em_iters):
             # ===== E-step =====
-            comp = self.pz_c()                                      # batch K MultivariateNormals
-            log_pzk = comp.log_prob(z_e)                            # (B, K)
-            log_pi  = F.log_softmax(self.pi_logits, dim=-1)         # (K,)
-            log_num = log_pi + log_pzk                              # (B, K)
-            log_den = torch.logsumexp(log_num, dim=-1, keepdim=True)
-            resp    = torch.exp(log_num - log_den)                  # γ_{bk} (B, K)
+            resp = self.log_prob_c_z(z_e, **kwargs)          # (B, K), γ_{bk}
 
             # ===== M-step =====
             # Effective counts
@@ -436,11 +442,9 @@ class GaussianMixture(ClusteringPrior):
             # Assumes you have: self.to_chol = transform_to(constraints.lower_cholesky)
             # and self.L is the unconstrained nn.Parameter such that self.chol_precision() == self.to_chol(self.L)
             with torch.no_grad():
-                self.L.data.copy_(self.to_chol.inv(R))
-
-        # current log-likelihood under the updated mixture
-        ll = self.pz().log_prob(z).sum()
-
+                self.raw_L.data.copy_(self.to_chol.inv(R))
+            ll = self.pz().log_prob(z).sum()
+            print(ll.item())
         return {"resp": resp, "Nk": Nk, "ll": ll}
 
 

@@ -318,7 +318,7 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
         #assert len(list(self.parameters())) == (len(self._model_params) + len(self._prior_params))
 
         # a dedicated optimizer for the **model** (user can replace this)
-        self.model_optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        #self.model_optimizer = optimizer
 
     @torch.no_grad()
     def _encoder_no_grad(self, x: torch.Tensor, **kwargs) -> td.Distribution:
@@ -328,6 +328,7 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
         """
         qz_x = self._define_variational_family(x, **kwargs)
         # Rebuild a distribution on detached parameters/tensors:
+        '''
         if isinstance(qz_x, td.Independent) and isinstance(qz_x.base_dist, td.Normal):
             loc  = qz_x.base_dist.loc.detach()
             scale = qz_x.base_dist.scale.detach()
@@ -338,6 +339,10 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
             mu = z
             std = torch.ones_like(z)
             return td.Independent(td.Normal(mu, std), 1)
+        '''
+        loc  = qz_x.base_dist.loc.detach()
+        scale = qz_x.base_dist.scale.detach()
+        return td.Independent(td.Normal(loc, scale), 1)
 
     @torch.no_grad()
     def get_metrics_result(self) -> Dict[str, float]:
@@ -350,18 +355,20 @@ class EmpiricalBayesVariationalAutoencoder(VariationalAutoencoder, metaclass=abc
         self.additional_metrics(data, vf)
         return self.get_metrics_result()
 
-    def train_step(self, data: Dict[str, torch.Tensor]):
+    def train_step(self, x: torch.Tensor, optimizer: torch.optim.Optimizer):
         """
         Step 1: update model (encoder/decoder + likelihood scale) via ELBO.
         Step 2: update prior parameters via prior.inference_step (EB update).
         """
         # ----- Step 1: model update (no prior params in this optimizer) -----
-        loss, vf = self.variational_inference_step(data["x"], optimizer=self.model_optimizer)
+        loss, vf = self.variational_inference_step(x, optimizer=optimizer)
 
         # ----- Step 2: prior-only update (prevent grads into encoder) -----
         # Provide a no-grad encoder callable so the prior updates only its params
-        self.prior.inference_step(encoder=self._encoder_no_grad, x=data["x"], training=False)
+        outputs = self.prior.inference_step(encoder=self._encoder_no_grad, x=x)
+        outputs["vae-loss"] = loss
 
         # metrics
-        self.additional_metrics(data, vf)
-        return self.get_metrics_result()
+        #self.additional_metrics(data, vf)
+        #return self.get_metrics_result()
+        return outputs
