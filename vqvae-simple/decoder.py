@@ -4,6 +4,10 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from torch.distributions import NegativeBinomial
 
+def softplus_inv(y: torch.Tensor) -> torch.Tensor:
+    # numerically stable inverse of softplus
+    return y + torch.log(-torch.expm1(-y))
+
 class Decoder(nn.Module):
     """
     Simple MLP decoder p_phi(x|z).
@@ -61,37 +65,80 @@ class NBDecoder(nn.Module):
     """
     p(x|z) = NB(mean=mu, inv_dispersion=theta)
     Parameterization: x ~ NB(theta, p), where mean mu = theta * (p/(1-p)).
-    We output:
-      mu    = softplus(W_mu h + b)
-      theta = softplus(W_th h + b)  (can also be per-feature only)
+
+    Options for theta:
+      - per-sample, per-feature (default): theta_head(h)
+      - per-feature shared across batch:  shared_theta=True
+      - scalar shared across all features: scalar_theta=True
+        (takes precedence over shared_theta if both are True)
     """
-    def __init__(self, z_dim, h_dim, n_layers, x_dim, dropout=0.0,
-                 shared_theta=False):
+    def __init__(
+        self,
+        z_dim: int,
+        h_dim: int,
+        n_layers: int,
+        x_dim: int,
+        dropout: float = 0.0,
+        shared_theta: bool = False,   # per-feature vector
+        *,
+        scalar_theta: bool = False,   # single scalar for all features
+        theta_init: float = 0.5,      # initial positive value for learnable theta
+        use_batchnorm: bool = True,
+        bn_momentum: float = 0.1,
+        bn_eps: float = 1e-5,
+        **kwargs,
+    ):
         super().__init__()
-        layers = [nn.Linear(z_dim, h_dim), nn.ReLU(inplace=True)]
-        if dropout > 0: layers.append(nn.Dropout(dropout))
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(h_dim, h_dim), nn.ReLU(inplace=True)]
-            if dropout > 0: layers.append(nn.Dropout(dropout))
+
+        # ----- backbone (with optional BN) -----
+        layers: list[nn.Module] = []
+        in_dim = z_dim
+        for _ in range(n_layers):
+            layers.append(nn.Linear(in_dim, h_dim, bias=not use_batchnorm))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(h_dim, eps=bn_eps, momentum=bn_momentum))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = h_dim
         self.backbone = nn.Sequential(*layers)
 
+        # ----- heads / parameters -----
         self.mu_head = nn.Linear(h_dim, x_dim)
-        if shared_theta:
-            self.theta_param = nn.Parameter(torch.zeros(1, x_dim))
-            self.theta_head = None
-        else:
-            self.theta_head = nn.Linear(h_dim, x_dim)
-            self.theta_param = None
+        nn.init.constant_(self.mu_head.bias, -2.0)
 
-    def forward(self, z):
-        h = self.backbone(z)
-        mu = F.softplus(self.mu_head(h)).clamp_min(1e-8)  # (B, x_dim)
-        if self.theta_head is not None:
-            theta = F.softplus(self.theta_head(h)).clamp_min(1e-8)
+        self.theta_head = None
+        self.theta_param = None
+        self.theta_scalar = None
+
+        if scalar_theta:
+            # single learnable scalar (unconstrained param -> softplus in forward)
+            init_u = softplus_inv(torch.tensor(float(theta_init)))
+            self.theta_scalar = nn.Parameter(init_u)         # shape []
+        elif shared_theta:
+            # one learnable value per feature (shared across batch)
+            init_u = softplus_inv(torch.full((1, x_dim), float(theta_init)))
+            self.theta_param = nn.Parameter(init_u)          # shape [1, D]
         else:
-            # broadcast shared per-feature theta
-            theta = F.softplus(self.theta_param).expand_as(mu)
+            # per-sample, per-feature predicted from h
+            self.theta_head = nn.Linear(h_dim, x_dim)
+            nn.init.constant_(self.theta_head.bias, -2.0)
+
+    def forward(self, z: torch.Tensor):
+        h = self.backbone(z)
+        mu = F.softplus(self.mu_head(h)).clamp_min(1e-8)  # [B, D]
+
+        if self.theta_head is not None:
+            theta = F.softplus(self.theta_head(h)).clamp_min(1e-8)         # [B, D]
+        elif self.theta_param is not None:
+            theta = F.softplus(self.theta_param).expand_as(mu).clamp_min(1e-8)  # [B, D]
+        else:
+            # scalar theta shared across all features & samples
+            theta_scalar_pos = F.softplus(self.theta_scalar).clamp_min(1e-8)     # []
+            theta = theta_scalar_pos.view(1, 1).expand_as(mu)                    # [B, D]
+
         return mu, theta  # both positive
+
 
 def nb_nll_from_mu_theta(x_int, mu, theta, reduction="mean"):
     """
@@ -111,6 +158,8 @@ def nb_nll_from_mu_theta(x_int, mu, theta, reduction="mean"):
     if reduction == "sum":
         return nll.sum()
     return nll
+
+
 
 class NBDecoder2(nn.Module):
     """

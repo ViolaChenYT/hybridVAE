@@ -48,6 +48,7 @@ class VQVAE(nn.Module):
         save_img_embedding_map: bool = False,
         dropout: float = 0.0,
         likelihood: str = None,
+        **kwargs,
     ):
         super().__init__()
         assert (x_dim is not None) ^ (out_shape is not None), \
@@ -67,6 +68,7 @@ class VQVAE(nn.Module):
             embedding_init=embedding_init,
             #normalize_init=normalize_init,
             trainable=trainable_codes,
+            **kwargs,
         )
 
         # Decoder: takes (B, embedding_dim) -> x
@@ -88,6 +90,7 @@ class VQVAE(nn.Module):
                 n_layers=n_layers_dec,
                 x_dim=x_dim,
                 dropout=dropout,
+                **kwargs,
             )
         else:
             raise ValueError(f"Unsupported likelihood: {likelihood}")
@@ -124,7 +127,7 @@ class VQVAE(nn.Module):
             return vq_loss, x_hat, perplexity, indices
         elif self.likelihood == "nb":
             mu,theta = self.decoder(z_q)
-            nll = nb_nll(x, mu, theta)
+            nll = nb_nll_from_mu_theta(x, mu, theta)
             return vq_loss, nll, perplexity, indices
         '''
         if return_indices:
