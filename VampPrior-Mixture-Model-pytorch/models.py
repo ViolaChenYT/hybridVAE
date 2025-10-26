@@ -13,15 +13,29 @@ import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def build_encoder(dim_x, h_dim, n_layers, dropout=0.0):
-    layers = [nn.Linear(dim_x, h_dim), nn.ReLU(inplace=True)]
-    if dropout > 0:
-        layers.append(nn.Dropout(dropout))
-    for _ in range(n_layers - 1):
-        layers += [nn.Linear(h_dim, h_dim), nn.ReLU(inplace=True)]
+def build_encoder(
+    dim_x: int,
+    h_dim: int,
+    n_layers: int,
+    dropout: float = 0.0,
+    *,
+    use_batchnorm: bool = True,
+    bn_momentum: float = 0.1,
+    bn_eps: float = 1e-5,
+    device=None,
+):
+    layers = []
+    in_dim = dim_x
+    for _ in range(n_layers):
+        layers.append(nn.Linear(in_dim, h_dim, bias=not use_batchnorm))
+        if use_batchnorm:
+            layers.append(nn.BatchNorm1d(h_dim, eps=bn_eps, momentum=bn_momentum))
+        layers.append(nn.ReLU(inplace=True))
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
-    return nn.Sequential(*layers).to(device)
+        in_dim = h_dim
+    return nn.Sequential(*layers) if device is None else nn.Sequential(*layers).to(device)
+
 
 class DiagGaussianDecoder(nn.Module):
     def __init__(self, dim_x: int, latent_dim: int, h_dim: int, n_layers: int, dropout: float = 0.0):
@@ -42,15 +56,132 @@ class DiagGaussianDecoder(nn.Module):
         # (Optional) small init for stability on logvar
         nn.init.constant_(self.logvar_head.bias, -4.0)  # start with std ~ exp(-2) ≈ 0.135
 
-    def forward(self, z: torch.Tensor):
+    def forward(self, x: torch.Tensor, z: torch.Tensor):
         h = self.backbone(z)
         mu = self.mu_head(h)
         logvar = self.logvar_head(h)
-        return mu, logvar
+        std = (0.5 * logvar).exp().clamp_min(1e-8)
+        base = td.Normal(loc=mu, scale=std)
+        return td.Independent(base, reinterpreted_batch_ndims=1)
 
 
-def build_decoder(dim_x, latent_dim, h_dim, n_layers, dropout=0.0, device=None):
+def build_decoder_gaussian(dim_x, latent_dim, h_dim, n_layers, dropout=0.0, device=None):
     dec = DiagGaussianDecoder(dim_x=dim_x, latent_dim=latent_dim, h_dim=h_dim, n_layers=n_layers, dropout=dropout)
+    if device is not None:
+        dec = dec.to(device)
+    return dec
+
+
+class NBDecoder(nn.Module):
+    """
+    p(x|z) = NB(mean = mu, inv_dispersion = theta)
+
+    PyTorch's NegativeBinomial is parameterized by (total_count=r, probs/logits).
+    Mapping from (mu, theta) to (r, logits):
+        r = theta
+        p = r / (r + mu)
+        logits = log(p / (1 - p)) = log(r) - log(mu)
+
+    We output:
+      mu    = softplus(W_mu h + b)         (per-sample, per-feature)
+      theta = softplus(W_th h + b)         (per-sample, per-feature)
+    """
+    def __init__(
+        self,
+        dim_x: int,
+        latent_dim: int,
+        h_dim: int,
+        n_layers: int,
+        dropout: float = 0.0,
+        eps: float = 1e-8,             # numerical floor for positivity/logs
+        clamp_logit: float | None = 20, # optional clamp for logits magnitude
+        theta_mode: str = "per_sample",     # "per_sample" | "per_feature" | "scalar"
+        theta_init: float = 0.5,            # initial positive value for learnable theta
+        use_batchnorm: bool = True,
+        bn_momentum: float = 0.1,
+        bn_eps: float = 1e-5,
+        library_init: float = 4000.0,
+    ):
+        super().__init__()
+        assert theta_mode in {"per_sample", "per_feature", "scalar"}
+
+        self.softplus = nn.Softplus()
+        self.eps = eps
+        self.clamp_logit = clamp_logit
+        self.dim_x = dim_x
+        self.theta_mode = theta_mode
+        #self.library = 5000.0
+        self._library_u = nn.Parameter(softplus_inv(torch.tensor(library_init)))
+
+        layers: list[nn.Module] = []
+        in_dim = latent_dim
+        for layer_idx in range(n_layers):
+            # If BN is used, we can drop bias in Linear (BN beta covers shift)
+            layers.append(nn.Linear(in_dim, h_dim, bias=not use_batchnorm))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(h_dim, eps=bn_eps, momentum=bn_momentum))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = h_dim
+        self.backbone = nn.Sequential(*layers)
+
+        # Two heads: mu (mean) and theta (inverse dispersion / total_count)
+        self.mu_head = nn.Linear(h_dim, dim_x)
+        #self.theta_head = nn.Linear(h_dim, dim_x)
+
+        # Small negative bias so softplus starts near small positive values
+        nn.init.constant_(self.mu_head.bias, -2.0)
+        #nn.init.constant_(self.theta_head.bias, -2.0)
+
+        if self.theta_mode == "per_sample":
+            self.theta_head = nn.Linear(h_dim, dim_x)
+            nn.init.constant_(self.theta_head.bias, -2.0)
+        elif self.theta_mode == "per_feature":
+            init_u = softplus_inv(torch.full((dim_x,), float(theta_init)))
+            self.theta_param = nn.Parameter(init_u)  # shape [D]
+        else:
+            init_u = softplus_inv(torch.tensor(float(theta_init)))
+            self.theta_scalar = nn.Parameter(init_u)           # shape []
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> td.Independent:
+        """
+        Returns an Independent(NegativeBinomial) over the last dimension (features).
+        - Input:  z  [B, latent_dim]
+        - Output: dist over x in shape [B, dim_x]
+        """
+        B = z.shape[0]
+        h = self.backbone(z)
+
+        # Positivity via softplus
+        #mu = self.softplus(self.mu_head(h)) + self.eps          # [B, D]
+        #library = self.softplus(self._library_u)  # scalar > 0
+        library = x.sum(dim=-1, keepdim=True)  # [B, 1]
+        #print(library)
+        mu = F.softmax(self.mu_head(h), dim=-1) * library + self.eps  # [B, D]
+        #theta = self.softplus(self.theta_head(h)) + self.eps     # [B, D]
+
+        if self.theta_mode == "per_sample":
+            theta = self.softplus(self.theta_head(h)) + self.eps        # [B, D]
+        elif self.theta_mode == "per_feature":
+            theta = self.softplus(self.theta_param).unsqueeze(0)         # [1, D]
+            theta = theta.expand(B, -1) + self.eps                       # [B, D]
+        else:
+            theta = self.softplus(self.theta_scalar).view(1, 1)          # [1,1]
+            theta = theta.expand(B, self.dim_x) + self.eps               # [B, D]
+
+        # logits = log(r) - log(mu), where r = theta
+        logits = torch.log(theta) - torch.log(mu)
+        if self.clamp_logit is not None:
+            logits = logits.clamp(min=-self.clamp_logit, max=self.clamp_logit)
+
+        base = td.NegativeBinomial(total_count=theta, logits=logits)  # batch shape [B, D], event shape ()
+        # Reinterpret the last batch dim (features) as event dims to form product distribution over D
+        dist = td.Independent(base, reinterpreted_batch_ndims=1)
+        return dist
+
+def build_decoder_nb(dim_x, latent_dim, h_dim, n_layers, dropout=0.0, device=None, **kwargs):
+    dec = NBDecoder(dim_x=dim_x, latent_dim=latent_dim, h_dim=h_dim, n_layers=n_layers, dropout=dropout, **kwargs)
     if device is not None:
         dec = dec.to(device)
     return dec
@@ -193,6 +324,7 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         return qz_x
 
     # ----- p(x|z) = Normal(decoder(z), scale) with all but first dim as event -----
+    '''
     def px(self, z: torch.Tensor, x_shape: torch.Size) -> td.Independent:
         out = self.decoder(z)
 
@@ -215,6 +347,9 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         base = td.Normal(loc=loc, scale=std)
         reinterpreted_batch_ndims = loc.dim() - 1          # treat all non-batch dims as event dims
         return td.Independent(base, reinterpreted_batch_ndims=reinterpreted_batch_ndims)
+    '''
+    def px(self, x: torch.Tensor, z: torch.Tensor) -> td.Independent:
+        return self.decoder(x, z)
 
     @contextmanager
     def _freeze_params(sefl, module: torch.nn.Module):
@@ -231,7 +366,7 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
     def variational_objective(self, x: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, Any]]:
         qz_x = self._define_variational_family(x, **kwargs)   # MVN
         z = qz_x.rsample()                                    # reparameterized
-        px_z = self.px(z, x_shape=x.shape)
+        px_z = self.px(x, z)
         expected_log_lik = px_z.log_prob(x)                   # (B,)
         with self._freeze_params(self.prior):
             dkl = self.prior.kl_divergence(qz_x)
@@ -251,6 +386,7 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         optimizer.zero_grad(set_to_none=True)
         loss, vf = self.variational_objective(x)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
         optimizer.step()
         return loss, vf
 
