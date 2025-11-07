@@ -3,10 +3,14 @@ import torch.nn as nn
 import numpy as np
 from encoder import Encoder
 from decoder import *
-from quantizer import VectorQuantizer
+from quantizer import VectorQuantizer, GaussianSQuantizer
 from typing import Optional, Tuple
 
 # assumes your Encoder, Decoder, and the updated VectorQuantizer (with embedding_init) are defined
+
+def inv_softplus(x, eps=1e-12):
+    x = torch.as_tensor(x, dtype=torch.get_default_dtype()).clamp_min(eps)
+    return x + torch.log(-torch.expm1(-x))
 
 class VQVAE(nn.Module):
     """
@@ -123,10 +127,10 @@ class VQVAE(nn.Module):
 
         # Decoder
         if self.likelihood == None:
-            x_hat = self.decoder(z_q)
+            x_hat = self.decoder(x, z_q)
             return vq_loss, x_hat, perplexity, indices
         elif self.likelihood == "nb":
-            mu,theta = self.decoder(z_q)
+            mu,theta = self.decoder(x, z_q)
             nll = nb_nll_from_mu_theta(x, mu, theta)
             return vq_loss, nll, perplexity, indices
         '''
@@ -134,3 +138,115 @@ class VQVAE(nn.Module):
             return vq_loss, x_hat, perplexity, indices
         return vq_loss, x_hat, perplexity
         '''
+
+
+class SQVAE(nn.Module):
+    def __init__(
+        self,
+        in_dim: Optional[int],
+        x_dim: Optional[int] = None,
+        out_shape: Optional[Tuple[int,int,int]] = None,
+        h_dim: int = 256,
+        n_layers_enc: int = 2,
+        n_layers_dec: int = 2,
+        n_embeddings: int = 512,
+        embedding_dim: int = 128,
+        var_x_init: float = 0.1,
+        likelihood: str = None,
+        dropout: float = 0.0,
+        out_activation: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        assert (x_dim is not None) ^ (out_shape is not None), \
+            "Specify exactly one of x_dim or out_shape."
+
+        # Encoder: outputs (B, embedding_dim)
+        self.encoder = Encoder(
+            in_dim=in_dim, h_dim=h_dim, n_layers=n_layers_enc,
+            out_dim=embedding_dim, dropout=dropout
+        )
+
+        # Vector quantizer with optional custom init
+        self.vector_quantization = GaussianSQuantizer(
+            n_e=n_embeddings,
+            e_dim=embedding_dim,
+            #beta=beta,
+            #embedding_init=embedding_init,
+            #normalize_init=normalize_init,
+            #trainable=trainable_codes,
+            **kwargs,
+        )
+
+        self.likelihood = likelihood
+        ### Gaussian decoder
+        if likelihood == None:
+            self.likelihood = "gaussian"
+            self.decoder = Decoder(
+                z_dim=embedding_dim,
+                h_dim=h_dim,
+                n_layers=n_layers_dec,
+                x_dim=x_dim,
+                out_shape=out_shape,
+                out_activation=out_activation,
+                dropout=dropout,
+            )
+            self.raw_var_x = nn.Parameter(inv_softplus(var_x_init))
+        elif likelihood == "nb":
+            self.decoder = NBDecoder(
+                z_dim=embedding_dim,
+                h_dim=h_dim,
+                n_layers=n_layers_dec,
+                x_dim=x_dim,
+                dropout=dropout,
+                **kwargs,
+            )
+        else:
+            raise ValueError(f"Unsupported likelihood: {likelihood}")
+        
+    def forward(self, x, beta, warmup = False):
+        z_e = self.encoder(x)
+        z_q, loss_kld_reg, loss_commit, metrics_latent = self.vector_quantization(z_e)
+
+        if self.likelihood == "gaussian":
+            x_hat = self.decoder(x, z_q)
+            loss_rec, rmse = self.compute_rec_loss_gaussian(x_hat, x)
+        elif self.likelihood == "nb":
+            if warmup:
+                mu,theta = self.decoder(x, z_e)
+            else:
+                mu,theta = self.decoder(x, z_q)
+            loss_rec = nb_nll_from_mu_theta(x, mu, theta)
+            rmse = -1
+        
+        loss = loss_rec + beta * (loss_kld_reg + loss_commit)
+        metrics = {}
+        metrics['rmse'] = rmse
+        metrics['loss'] = loss.detach()
+        metrics['loss_rec'] = loss_rec.detach()
+        metrics.update(metrics_latent)
+
+        return loss, metrics
+    
+    def compute_rec_loss_gaussian(self, x_rec, x_gt):
+        # Reconstruction loss
+        bs, *shape = x_rec.shape
+        dim_x = np.prod(shape)
+
+        # square-error
+        se = F.mse_loss(x_rec, x_gt, reduction="sum") / bs
+
+        # "Preventing Posterior Collapse Induced by Oversmoothing in Gaussian VAE"
+        # https://arxiv.org/abs/2102.08663
+        #loss_rec = dim_x * torch.log(se) / 2
+
+        var = F.softplus(self.raw_var_x) + 1e-9
+        logvar = torch.log(var)
+        loss_rec = 0.5 * (se / var + dim_x * logvar)
+
+        rmse = (se.detach() / dim_x).sqrt()
+
+        return loss_rec, rmse
+    
+    def set_temperature(self, t):
+        self.vector_quantization.set_temperature(t)

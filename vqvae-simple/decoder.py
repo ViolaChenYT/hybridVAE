@@ -49,17 +49,17 @@ class Decoder(nn.Module):
         layers += [nn.Linear(h_dim, self.out_dim)]
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        x = self.mlp(z)  # (B, out_dim)
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        x_out = self.mlp(z)  # (B, out_dim)
         if self.out_activation == 'sigmoid':
-            x = torch.sigmoid(x)
+            x_out = torch.sigmoid(x_out)
         elif self.out_activation == 'tanh':
-            x = torch.tanh(x)
+            x_out = torch.tanh(x_out)
 
         if self.out_shape is not None:
             B = z.size(0)
-            x = x.view(B, *self.out_shape)  # (B, C, H, W)
-        return x
+            x_out = x_out.view(B, *self.out_shape)  # (B, C, H, W)
+        return x_out
 
 class NBDecoder(nn.Module):
     """
@@ -80,12 +80,12 @@ class NBDecoder(nn.Module):
         x_dim: int,
         dropout: float = 0.0,
         shared_theta: bool = False,   # per-feature vector
-        *,
         scalar_theta: bool = False,   # single scalar for all features
         theta_init: float = 0.5,      # initial positive value for learnable theta
         use_batchnorm: bool = True,
         bn_momentum: float = 0.1,
         bn_eps: float = 1e-5,
+        eps: float = 1e-8, 
         **kwargs,
     ):
         super().__init__()
@@ -102,6 +102,7 @@ class NBDecoder(nn.Module):
                 layers.append(nn.Dropout(dropout))
             in_dim = h_dim
         self.backbone = nn.Sequential(*layers)
+        self.eps = eps
 
         # ----- heads / parameters -----
         self.mu_head = nn.Linear(h_dim, x_dim)
@@ -124,9 +125,12 @@ class NBDecoder(nn.Module):
             self.theta_head = nn.Linear(h_dim, x_dim)
             nn.init.constant_(self.theta_head.bias, -2.0)
 
-    def forward(self, z: torch.Tensor):
+    def forward(self,  x: torch.Tensor, z: torch.Tensor):
         h = self.backbone(z)
-        mu = F.softplus(self.mu_head(h)).clamp_min(1e-8)  # [B, D]
+        #mu = F.softplus(self.mu_head(h)).clamp_min(1e-8)  # [B, D]
+        #library = 5000.0
+        library = x.sum(dim=-1, keepdim=True)  # [B, 1]
+        mu = F.softmax(self.mu_head(h), dim=-1) * library + self.eps  # [B, D]
 
         if self.theta_head is not None:
             theta = F.softplus(self.theta_head(h)).clamp_min(1e-8)         # [B, D]

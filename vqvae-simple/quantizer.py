@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pdb
 
 class VectorQuantizer(nn.Module):
     """
@@ -292,3 +293,109 @@ z_e = enc(x)                 # (B, 128)
 vq_loss, z_q, ppl, one_hot, idx = vq(z_e)
 x_hat = dec(z_q)
 '''
+
+class GaussianSQuantizer(nn.Module):
+    def __init__(
+        self,
+        n_e: int,
+        e_dim: int,
+        var_q_init: float = 1.0,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.temperature = temperature
+
+        self.embedding = nn.Parameter(torch.randn(self.n_e, self.e_dim))
+        self.var_q_logit = nn.Parameter(torch.zeros(1))
+        self.temperature = temperature
+
+        self.register_buffer('init', torch.zeros(1, dtype=torch.bool))
+
+        self.var_q_init = var_q_init
+        self.register_buffer('var_init', torch.tensor([var_q_init]))
+    
+    def _compute_var_q(self):
+        return torch.sigmoid(self.var_q_logit) * 2. * self.var_init
+    
+    def _compute_var_q_logit(self, var_q):
+        return torch.logit(var_q / (2. * self.var_init + 1e-10) + 1e-10)
+
+    def forward(self, z: torch.Tensor):
+
+        if self.training and not self.init[0]:
+            self._init_codebook(z)
+        
+        # limit variance range using sigmoid
+        var_q = self._compute_var_q()
+
+        # Quantize 
+        z_quantize, loss_kld_reg, loss_commit, metrics = self.quantize(z, var_q)
+
+        metrics['variance_q'] = float(var_q.mean())
+
+        return z_quantize, loss_kld_reg, loss_commit, metrics
+    
+    def _posterior_quantize_probs(self, z: torch.Tensor, var_q: torch.Tensor):
+        # Posterior distance
+        weight_q = 0.5 / torch.clamp(var_q, min=1e-10)
+        logit = -self._calc_distance_bw_enc_codes(z, weight_q)
+        probs = torch.softmax(logit, dim=-1)
+        log_probs = torch.log_softmax(logit, dim=-1)
+        return weight_q, logit, probs, log_probs
+    
+    def quantize(self, z: torch.Tensor, var_q: torch.Tensor):
+        weight_q, logit, probs, log_probs = self._posterior_quantize_probs(z, var_q)
+
+        if self.training:
+            encodings = F.gumbel_softmax(logit, tau=self.temperature)  # [N, n_e]
+            z_quantized = torch.mm(encodings, self.embedding)  # [N, e_dim]
+        else:
+            idxs_enc = torch.argmax(logit, dim=1)  # [N]
+            z_quantized = F.embedding(idxs_enc, self.embedding)
+        
+        # entropy loss
+        loss_kld_reg = torch.sum(probs * log_probs) / z.shape[0]
+
+        # commitment loss
+        loss_commit = self._calc_distance_bw_enc_dec(z, z_quantized, weight_q) / z.shape[0] + 0.5 * self.e_dim * torch.log(torch.clamp(var_q, min=1e-10))
+
+        loss_latent = loss_kld_reg + loss_commit
+
+        metrics = {} # logging
+        metrics['loss_kld_reg'] = loss_kld_reg.item()
+        metrics['loss_commit'] = loss_commit.item()
+        metrics["loss_latent"] = loss_latent.item()
+
+        return z_quantized, loss_kld_reg, loss_commit, metrics
+    
+    def _calc_distance_bw_enc_codes(self, z, weight_q):
+        distances = weight_q * self._se_codebook(z)
+        return distances
+    
+    def _calc_distance_bw_enc_dec(self, z_e, z_q, weight_q):
+        return torch.sum((z_e - z_q)**2 * weight_q)
+    
+    def _se_codebook(self, z: torch.Tensor):
+        # z: (N, e_dim)
+        # embedding: (n_e, e_dim)
+        # distances: (N, n_e)
+        distances = torch.sum(z**2, dim=1, keepdim=True)\
+                    + torch.sum(self.embedding**2, dim=1) - 2 * torch.mm(z, self.embedding.t())
+        return distances
+        
+    def _init_codebook(self, z: torch.Tensor):
+        _k_rand = z[torch.randperm(z.size(0))][:self.n_e]
+        self.embedding.data.copy_(_k_rand)
+        var_init = torch.var(z, dim=0).mean().clone().detach() * self.var_q_init
+        self.var_init[:] = var_init
+        self.init[0] = True
+        print(f'Variance was initialized to {var_init}')
+    
+    def set_temperature(self, value: float):
+        self.temperature = value
+    
+    def _reset_codebook(self, ref_codes):
+        self.embedding.data.copy_(ref_codes)
+
