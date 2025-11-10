@@ -21,7 +21,7 @@ import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-datatype = "data2"
+datatype = "data1"
 data_path = "/n/fs/ragr-data/users/yihangs/Celegan/structuredVAE/codes/vampprior-mixture-model-test/origin/VampPrior-Mixture-Model/data/simulation/1d-nb/"+datatype+"/"
 X = np.load(data_path + "X.npy")
 y = np.load(data_path + "Y.npy")
@@ -43,7 +43,8 @@ predict_label_ari_list = []
 gmm_fit_label_nmi_list = []
 gmm_fit_label_ari_list = []
 
-for trial in range(10):
+for trial in range(10,20):
+    #save_path = "/n/fs/ragr-data/users/yihangs/Celegan/structuredVAE/codes/vqvae-test/vqvae-simple/results/sqvae/simulation/1d-nb/"+datatype+"/sqvae+/trial_"+str(trial)+"/"
     save_path = "/n/fs/ragr-data/users/yihangs/Celegan/structuredVAE/codes/vqvae-test/vqvae-simple/results/sqvae/simulation/1d-nb/"+datatype+"/trial_"+str(trial)+"/"
     os.makedirs(save_path, exist_ok=True)
     model = SQVAE(
@@ -53,6 +54,7 @@ for trial in range(10):
         var_x_init=0.5,
         var_q_init = 1.0,
         likelihood = "nb",
+        initial_method = "kmeans",
         #beta=0.25,
         #embedding_init=np.array(cluster_centers).reshape(4,1),
         #trainable_codes=True,
@@ -90,7 +92,8 @@ for trial in range(10):
         '''
     model.eval()
     with torch.no_grad():
-        latent_params = model.encoder(X.to(device))
+        X_log1p = torch.log1p(X)
+        latent_params = model.encoder(X_log1p.to(device))
         _,_,probs,_ = model.vector_quantization._posterior_quantize_probs(latent_params, model.vector_quantization._compute_var_q())
         predicted_clusters =  torch.argmax(probs, dim=1)
         np.save(save_path + "latent_params.npy", latent_params.detach().cpu().numpy())

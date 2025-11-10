@@ -301,11 +301,13 @@ class GaussianSQuantizer(nn.Module):
         e_dim: int,
         var_q_init: float = 1.0,
         temperature: float = 1.0,
+        initial_method: str = "random",
     ):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
         self.temperature = temperature
+        self.initial_method = initial_method
 
         self.embedding = nn.Parameter(torch.randn(self.n_e, self.e_dim))
         self.var_q_logit = nn.Parameter(torch.zeros(1))
@@ -386,8 +388,14 @@ class GaussianSQuantizer(nn.Module):
         return distances
         
     def _init_codebook(self, z: torch.Tensor):
-        _k_rand = z[torch.randperm(z.size(0))][:self.n_e]
-        self.embedding.data.copy_(_k_rand)
+        if self.initial_method == "random":
+            new_codebooks = z[torch.randperm(z.size(0))][:self.n_e]
+        elif self.initial_method == "kmeans":
+            from torchpq.clustering import KMeans
+            kmeans = KMeans(n_clusters=self.n_e, distance='euclidean', init_mode="kmeans++")
+            _ = kmeans.fit(z.detach().T.contiguous())
+            new_codebooks = kmeans.centroids.T.contiguous()
+        self.embedding.data.copy_(new_codebooks)
         var_init = torch.var(z, dim=0).mean().clone().detach() * self.var_q_init
         self.var_init[:] = var_init
         self.init[0] = True
