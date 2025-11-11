@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pdb
+import math
 
 class VectorQuantizer(nn.Module):
     """
@@ -301,30 +302,43 @@ class GaussianSQuantizer(nn.Module):
         e_dim: int,
         var_q_init: float = 1.0,
         temperature: float = 1.0,
-        initial_method: str = "random",
+        initial_method: str = "kmeans",
+        var_mode: str = "global",
     ):
         super().__init__()
+        assert initial_method in ["random", "kmeans"]
+        assert var_mode in ["global", "per_dim", "per_code_dim"]
         self.n_e = n_e
         self.e_dim = e_dim
         self.temperature = temperature
         self.initial_method = initial_method
+        self.var_mode = var_mode
 
         self.embedding = nn.Parameter(torch.randn(self.n_e, self.e_dim))
-        self.var_q_logit = nn.Parameter(torch.zeros(1))
+        #self.var_q_logit = nn.Parameter(torch.zeros(1))
         self.temperature = temperature
 
         self.register_buffer('init', torch.zeros(1, dtype=torch.bool))
 
         self.var_q_init = var_q_init
-        self.register_buffer('var_init', torch.tensor([var_q_init]))
-    
+        #self.register_buffer('var_init', torch.tensor([var_q_init]))
+
+        if self.var_mode == "global":
+            self.var_q_logit = nn.Parameter(torch.zeros(1))
+        elif self.var_mode == "per_dim":
+            self.var_q_logit = nn.Parameter(torch.zeros(self.e_dim))
+        elif self.var_mode == "per_code_dim":
+            self.var_q_logit = nn.Parameter(torch.zeros(self.n_e, self.e_dim))
+
     def _compute_var_q(self):
         return torch.sigmoid(self.var_q_logit) * 2. * self.var_init
     
     def _compute_var_q_logit(self, var_q):
+        assert var_q.shape == self.var_init.shape
         return torch.logit(var_q / (2. * self.var_init + 1e-10) + 1e-10)
 
     def forward(self, z: torch.Tensor):
+        #pdb.set_trace()
 
         if self.training and not self.init[0]:
             self._init_codebook(z)
@@ -332,13 +346,25 @@ class GaussianSQuantizer(nn.Module):
         # limit variance range using sigmoid
         var_q = self._compute_var_q()
 
-        # Quantize 
-        z_quantize, loss_kld_reg, loss_commit, metrics = self.quantize(z, var_q)
+        # broadcase to (1, n_e, e_dim)
+        if var_q.dim() == 1:
+            if var_q.numel() == 1:    # global
+                var_q_reshape = var_q.view(1, 1, 1)
+            else:
+                assert var_q.numel() == self.e_dim  # per-dim
+                var_q_reshape = var_q.view(1, 1, self.e_dim)
+        else:
+            # per_code_dim
+            var_q_reshape = var_q.unsqueeze(0)
 
-        metrics['variance_q'] = float(var_q.mean())
+        # Quantize 
+        z_quantize, loss_kld_reg, loss_commit, metrics = self.quantize(z, var_q_reshape)
+
+        metrics['variance_q'] = var_q
 
         return z_quantize, loss_kld_reg, loss_commit, metrics
     
+    '''
     def _posterior_quantize_probs(self, z: torch.Tensor, var_q: torch.Tensor):
         # Posterior distance
         weight_q = 0.5 / torch.clamp(var_q, min=1e-10)
@@ -346,9 +372,26 @@ class GaussianSQuantizer(nn.Module):
         probs = torch.softmax(logit, dim=-1)
         log_probs = torch.log_softmax(logit, dim=-1)
         return weight_q, logit, probs, log_probs
+    '''
+    def _posterior_quantize_probs(self, z: torch.Tensor, var_q: torch.Tensor):
+        z_exp = z.unsqueeze(1)  # [N, 1, e_dim]
+        mu_exp = self.embedding.unsqueeze(0)  # [1, n_e, e_dim]
+
+        diff2 = (z_exp - mu_exp) ** 2  # [N, n_e, e_dim]
+        log2pi = math.log(2.0 * math.pi)
+
+        logit = -0.5 * (
+            (diff2 / var_q).sum(dim=-1)             # (B, K)
+            + var_q.log().sum(dim=-1)               # (B, K) via broadcasted sum
+            + self.e_dim * log2pi
+        )   
+
+        log_probs = torch.log_softmax(logit, dim=-1)   # (B, K)
+        probs = log_probs.exp()                       # (B, K)
+        return logit, probs, log_probs
     
     def quantize(self, z: torch.Tensor, var_q: torch.Tensor):
-        weight_q, logit, probs, log_probs = self._posterior_quantize_probs(z, var_q)
+        logit, probs, log_probs = self._posterior_quantize_probs(z, var_q)
 
         if self.training:
             encodings = F.gumbel_softmax(logit, tau=self.temperature)  # [N, n_e]
@@ -361,7 +404,8 @@ class GaussianSQuantizer(nn.Module):
         loss_kld_reg = torch.sum(probs * log_probs) / z.shape[0]
 
         # commitment loss
-        loss_commit = self._calc_distance_bw_enc_dec(z, z_quantized, weight_q) / z.shape[0] + 0.5 * self.e_dim * torch.log(torch.clamp(var_q, min=1e-10))
+        #loss_commit = self._calc_distance_bw_enc_dec(z, z_quantized, weight_q) / z.shape[0] + 0.5 * self.e_dim * torch.log(torch.clamp(var_q, min=1e-10))
+        loss_commit = - torch.sum(probs * logit) / z.shape[0]
 
         loss_latent = loss_kld_reg + loss_commit
 
@@ -372,6 +416,7 @@ class GaussianSQuantizer(nn.Module):
 
         return z_quantized, loss_kld_reg, loss_commit, metrics
     
+    '''
     def _calc_distance_bw_enc_codes(self, z, weight_q):
         distances = weight_q * self._se_codebook(z)
         return distances
@@ -386,6 +431,7 @@ class GaussianSQuantizer(nn.Module):
         distances = torch.sum(z**2, dim=1, keepdim=True)\
                     + torch.sum(self.embedding**2, dim=1) - 2 * torch.mm(z, self.embedding.t())
         return distances
+    '''
         
     def _init_codebook(self, z: torch.Tensor):
         if self.initial_method == "random":
@@ -396,10 +442,25 @@ class GaussianSQuantizer(nn.Module):
             _ = kmeans.fit(z.detach().T.contiguous())
             new_codebooks = kmeans.centroids.T.contiguous()
         self.embedding.data.copy_(new_codebooks)
-        var_init = torch.var(z, dim=0).mean().clone().detach() * self.var_q_init
-        self.var_init[:] = var_init
+        if self.var_mode == "global":
+            var_init = torch.var(z, dim=0).mean().clone().detach() * self.var_q_init
+            self.register_buffer("var_init", var_init.view(1))
+        elif self.var_mode == "per_dim":
+            var_init = torch.var(z, dim=0).clone().detach() * self.var_q_init
+            var_init = torch.clamp(var_init, min=1e-8)
+            self.register_buffer("var_init", var_init.clone())
+        elif self.var_mode == "per_code_dim":
+            base = torch.var(z, dim=0).clone().detach() * self.var_q_init
+            base = torch.clamp(base, min=1e-8)
+            var_init = base.expand(self.n_e, self.e_dim).clone()
+            self.register_buffer("var_init", var_init)
+        assert self.var_q_logit.shape == self.var_init.shape
+        #pdb.set_trace()
+        #self.var_q_logit.to(z.device)
+        #self.var_init.to(z.device)
         self.init[0] = True
-        print(f'Variance was initialized to {var_init}')
+        if self.var_mode == "global":
+            print(f'Variance was initialized to {var_init}')
     
     def set_temperature(self, value: float):
         self.temperature = value

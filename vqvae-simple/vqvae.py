@@ -205,8 +205,11 @@ class SQVAE(nn.Module):
             raise ValueError(f"Unsupported likelihood: {likelihood}")
         
     def forward(self, x, beta, warmup = False):
-        x_log1p = torch.log1p(x)
-        z_e = self.encoder(x_log1p)
+        if self.likelihood == "gaussian":
+            z_e = self.encoder(x)
+        elif self.likelihood == "nb":
+            x_log1p = torch.log1p(x)
+            z_e = self.encoder(x_log1p)
         z_q, loss_kld_reg, loss_commit, metrics_latent = self.vector_quantization(z_e)
 
         if self.likelihood == "gaussian":
