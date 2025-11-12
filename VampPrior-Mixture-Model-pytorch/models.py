@@ -379,7 +379,7 @@ class VariationalAutoencoder(nn.Module, metaclass=abc.ABCMeta):
         self.dkl_tracker.update(dkl.mean())
 
         loss = -elbo.mean()
-        return loss, {"qz_x": qz_x}
+        return loss, {"qz_x": qz_x, "expected_log_lik": expected_log_lik, "dkl": dkl, "elbo": elbo}
 
     # ----- one optimization step (pass optimizer explicitly) -----
     def variational_inference_step(self, x: torch.Tensor, optimizer: torch.optim.Optimizer) -> Dict[str, Any]:

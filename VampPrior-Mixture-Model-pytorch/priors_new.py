@@ -356,7 +356,15 @@ class GaussianMixture(ClusteringPrior):
         cat = td.Categorical(logits=self.pi_logits)
         comp = self.pz_c(**kwargs)
         return td.MixtureSameFamily(cat, comp)
-    '''
+    
+    def cluster_probabilities(self, *, samples: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Given samples z ~ q(z|x): return q(c|z) ∝ p(z|c) π_c
+        samples: (B, D) → returns (B, K)
+        """
+        z = samples.unsqueeze(1)  # (B, 1, D)
+        return self.qc(z, **kwargs)
+
     # --- log p(z | c) for a batch of z ---
     def log_prob_z_c(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -366,7 +374,7 @@ class GaussianMixture(ClusteringPrior):
         if z.dim() == 2:
             z = z.unsqueeze(1)                       # (B, 1, D)
         return self.pz_c(**kwargs).log_prob(z)       # broadcast → (B, K)
-    '''
+
     def log_prob_c_z(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
         comp = self.pz_c()                                      # batch K MultivariateNormals
         log_pzk = comp.log_prob(z)                            # (B, K)
