@@ -5,6 +5,8 @@ from encoder import Encoder
 from decoder import *
 import torch.nn.functional as F
 import pdb
+from torchpq.clustering import KMeans
+from torch.distributions import Categorical, Normal, MixtureSameFamily
 
 
 class WAE1D(nn.Module):
@@ -21,6 +23,7 @@ class WAE1D(nn.Module):
         likelihood: str = None,
         dropout: float = 0.0,
         out_activation: Optional[str] = None,
+        auto_init: int = 1,
         **kwargs,
     ):
         super().__init__()
@@ -58,6 +61,12 @@ class WAE1D(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported likelihood: {likelihood}")
+        
+        assert auto_init in [0,1]
+        if auto_init:
+            self.register_buffer('init', torch.zeros(1, dtype=torch.bool))
+        else:
+            self.register_buffer('init', torch.ones(1, dtype=torch.bool))
     
     def forward(self, x: torch.Tensor, weight = 10.0):
         # Encode
@@ -75,6 +84,9 @@ class WAE1D(nn.Module):
             z = self.encoder(x_log1p)
             mu,theta = self.decoder(x, z)
             recon_loss = nb_nll_from_mu_theta(x, mu, theta)
+        
+        if self.training and not self.init[0]:
+            self._init_prior(z)
         
         wd = self.wasserstein_distance_1d(z, self.prior)
         w2 = weight * wd
@@ -97,3 +109,20 @@ class WAE1D(nn.Module):
             reduction='sum'
         ) / bs
         return wasserstein_distance
+    
+    def _init_prior(self, z: torch.Tensor):
+        #pdb.set_trace()
+        n_clusters = self.prior.mixture_distribution.logits.shape[-1]
+        ### use k-means to init cluster centers
+        kmeans = KMeans(n_clusters=n_clusters, distance='euclidean', init_mode="kmeans++")
+        _ = kmeans.fit(z.detach().T.contiguous())
+        centroids = kmeans.centroids.T.contiguous().reshape(-1).to(device=z.device) *2
+        var_init = torch.var(z, dim=0).mean().clone().detach().to(device=z.device)/ n_clusters
+        stds = torch.sqrt(var_init).clamp_min(1e-6) * torch.ones_like(centroids)
+        mix_probs = torch.full((n_clusters,), 1.0 / n_clusters, device=z.device)
+        mix = Categorical(mix_probs)
+        comp = Normal(centroids, stds)               # batch of K Normals
+        gmm = MixtureSameFamily(mix, comp)
+        self.prior = gmm
+        #self.prior = self.prior.to(z.device)
+        self.init[0] = True
