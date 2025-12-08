@@ -328,8 +328,14 @@ if __name__ == '__main__':
     N_tot = count_mat_tensor.size(0)  # ==== NEW: use this early ====
     unique_batches, batch_int = np.unique(np.asarray(adata.obs["batch"].tolist()), return_inverse=True)
     batch_int_tensor = torch.from_numpy(batch_int).to(device).to(torch.int64).unsqueeze(-1)
-    n_clusters = len(np.unique(np.array(adata.obs["lineage"].tolist())))
-    labels = np.array(adata.obs["lineage"].tolist())
+    label_idx_dict, if_missing = label_order_index(adata.obs["lineage"].unique().tolist())
+    print(label_idx_dict)
+    lineage_label = adata.obs['lineage'].apply(
+                lambda x: label_idx_dict[x]
+            ).tolist()
+    n_clusters = len(np.unique(np.array(lineage_label)))
+    #n_clusters = len(np.unique(np.array(adata.obs["lineage"].tolist())))
+    #labels = np.array(adata.obs["lineage"].tolist())
 
 
     ### compute phate to get pairwise distance matrix
@@ -376,7 +382,7 @@ if __name__ == '__main__':
     ### learnable parameters in prior (tunable!!)
     train_prior_means = True
     train_prior_stds = True
-    train_prior_mix = True
+    train_prior_mix = False
 
     centroids = torch.nn.Parameter(torch.zeros(n_clusters, device=device))
     log_stds = torch.nn.Parameter(torch.zeros(n_clusters, device=device))
@@ -629,11 +635,6 @@ if __name__ == '__main__':
         inference_outputs = model._regular_inference(**inference_inputs)
         mu_q = inference_outputs["qz"].mean
         mu = mu_q.detach().flatten().to("cpu").numpy()
-    label_idx_dict, if_missing = label_order_index(adata.obs["lineage"].unique().tolist())
-    print(label_idx_dict)
-    lineage_label = adata.obs['lineage'].apply(
-                lambda x: label_idx_dict[x]
-            ).tolist()
     r, p = spearmanr(mu.reshape(-1), np.array(lineage_label))
     abs_r = abs(r)
     print(abs_r)
